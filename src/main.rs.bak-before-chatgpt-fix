@@ -1,0 +1,172 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::process::Stdio;
+use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: String,
+    id: Option<Value>,
+    method: String,
+    params: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut reader = BufReader::new(stdin()).lines();
+    let mut writer = stdout();
+
+    while let Ok(Some(line)) = reader.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let req: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // 如果是 Notification（没有 id），无需响应
+        let req_id = match req.id {
+            Some(id) => id,
+            None => continue,
+        };
+
+        let response = match req.method.as_str() {
+            "initialize" => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(req_id),
+                result: Some(json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "rust-mcp-shell",
+                        "version": "0.1.0"
+                    }
+                })),
+                error: None,
+            },
+            "tools/list" => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(req_id),
+                result: Some(json!({
+                    "tools": [
+                        {
+                            "name": "bash_exec",
+                            "description": "Execute a bash command safely on the host",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "command": {
+                                        "type": "string",
+                                        "description": "The shell command to be executed"
+                                    }
+                                },
+                                "required": ["command"]
+                            }
+                        }
+                    ]
+                })),
+                error: None,
+            },
+            "tools/call" => handle_tool_call(req_id, req.params).await,
+            _ => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(req_id),
+                result: None,
+                error: Some(json!({ "code": -32601, "message": "Method not found" })),
+            },
+        };
+
+        let mut out = serde_json::to_string(&response)?;
+        out.push('\n');
+        writer.write_all(out.as_bytes()).await?;
+        writer.flush().await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_tool_call(id: Value, params: Option<Value>) -> JsonRpcResponse {
+    let params = params.unwrap_or_default();
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or_default();
+
+    if name != "bash_exec" {
+        return JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            result: None,
+            error: Some(json!({ "code": -32602, "message": "Unknown tool" })),
+        };
+    }
+
+    let command = match args.get("command").and_then(|v| v.as_str()) {
+        Some(cmd) => cmd,
+        None => {
+            return JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id),
+                result: None,
+                error: Some(json!({ "code": -32602, "message": "Missing command argument" })),
+            }
+        }
+    };
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let stdout_str = String::from_utf8_lossy(&out.stdout);
+            let stderr_str = String::from_utf8_lossy(&out.stderr);
+            let combined = format!(
+                "Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+                out.status.code().unwrap_or(-1),
+                stdout_str,
+                stderr_str
+            );
+
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id),
+                result: Some(json!({
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": combined
+                        }
+                    ],
+                    "isError": !out.status.success()
+                })),
+                error: None,
+            }
+        }
+        Err(e) => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            result: None,
+            error: Some(json!({ "code": -32000, "message": format!("Execution failed: {}", e) })),
+        },
+    }
+}
