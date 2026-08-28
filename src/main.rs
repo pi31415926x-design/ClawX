@@ -1,8 +1,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -21,6 +23,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_IN_FLIGHT: usize = 16;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RESPONSE_QUEUE_SIZE: usize = 128;
+const MAX_JOBS: usize = 64;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -29,6 +32,64 @@ struct JsonRpcRequest {
     id: Option<Value>,
     method: String,
     params: Option<Value>,
+}
+
+#[derive(Debug)]
+struct JobStore {
+    jobs: Mutex<HashMap<String, JobStatus>>,
+    next_id: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct JobStatus {
+    state: &'static str,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl JobStore {
+    fn new() -> Self {
+        Self {
+            jobs: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn create(&self) -> Option<(String, JobStatus)> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if jobs.len() >= MAX_JOBS {
+            return None;
+        }
+        let id = format!("job-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
+        let status = JobStatus {
+            state: "running",
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        jobs.insert(id.clone(), status.clone());
+        Some((id, status))
+    }
+
+    fn update(&self, id: &str, status: JobStatus) {
+        if let Some(job) = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(id)
+        {
+            *job = status;
+        }
+    }
+
+    fn get(&self, id: &str) -> Option<JobStatus> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +140,7 @@ async fn main() -> Result<()> {
     // Rust analogue of letting a child task's exception escape an
     // unattended TaskGroup/ExceptionGroup.
     let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+    let jobs = Arc::new(JobStore::new());
     let mut in_flight: JoinSet<()> = JoinSet::new();
 
     while let Ok(Some(line)) = reader.next_line().await {
@@ -107,12 +169,13 @@ async fn main() -> Result<()> {
 
         let tx = tx.clone();
         let semaphore = semaphore.clone();
+        let jobs_for_task = jobs.clone();
         in_flight.spawn(async move {
             let permit = match semaphore.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let response = dispatch(req_id, method, params).await;
+            let response = dispatch(req_id, method, params, jobs_for_task).await;
             drop(permit);
             match serde_json::to_string(&response) {
                 Ok(out) => {
@@ -149,7 +212,12 @@ fn log_join_result(res: std::result::Result<(), JoinError>) {
     }
 }
 
-async fn dispatch(req_id: Value, method: String, params: Option<Value>) -> JsonRpcResponse {
+async fn dispatch(
+    req_id: Value,
+    method: String,
+    params: Option<Value>,
+    jobs: Arc<JobStore>,
+) -> JsonRpcResponse {
     match method.as_str() {
         "initialize" => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
@@ -193,12 +261,30 @@ async fn dispatch(req_id: Value, method: String, params: Option<Value>) -> JsonR
                             },
                             "required": ["exit_code", "stdout", "stderr"]
                         }
+                    },
+                    {
+                        "name": "bash_exec_async",
+                        "description": "Start a bash command in the background and return immediately with a job_id",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"]
+                        }
+                    },
+                    {
+                        "name": "bash_job_status",
+                        "description": "Get the status and output of a background bash job",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"job_id": {"type": "string"}},
+                            "required": ["job_id"]
+                        }
                     }
                 ]
             })),
             error: None,
         },
-        "tools/call" => handle_tool_call(req_id, params).await,
+        "tools/call" => handle_tool_call(req_id, params, jobs).await,
         _ => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: Some(req_id),
@@ -217,17 +303,129 @@ fn error_response(id: Value, code: i64, message: impl Into<String>) -> JsonRpcRe
     }
 }
 
-async fn handle_tool_call(id: Value, params: Option<Value>) -> JsonRpcResponse {
+async fn execute_command(command: &str) -> std::result::Result<(i32, String, String), String> {
+    let mut child = Command::new("setsid")
+        .arg("bash")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Execution failed: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout was not piped".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr was not piped".to_string())?;
+    let stdout_task = tokio::spawn(read_limited(stdout, MAX_OUTPUT_BYTES));
+    let stderr_task = tokio::spawn(read_limited(stderr, MAX_OUTPUT_BYTES));
+    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("Execution failed: {e}")),
+        Err(_) => {
+            if let Some(pid) = child.id() {
+                let _ = Command::new("pkill")
+                    .arg("-TERM")
+                    .arg("-s")
+                    .arg(pid.to_string())
+                    .output()
+                    .await;
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(format!(
+                "Execution timed out after {}s",
+                COMMAND_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    let stdout = stdout_task
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.map_err(|e| e.to_string()))?;
+    Ok((status.code().unwrap_or(-1), stdout, stderr))
+}
+
+async fn handle_tool_call(
+    id: Value,
+    params: Option<Value>,
+    jobs: Arc<JobStore>,
+) -> JsonRpcResponse {
     let params = params.unwrap_or_default();
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_default();
-    if name != "bash_exec" {
-        return error_response(id, -32602, "Unknown tool");
+    if name == "bash_job_status" {
+        let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
+            Some(v) if !v.is_empty() => v,
+            _ => return error_response(id, -32602, "Missing job_id argument"),
+        };
+        return match jobs.get(job_id) {
+            Some(job) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id),
+                error: None,
+                result: Some(
+                    json!({"content":[{"type":"text","text":format!("state={}\nexit_code={:?}\nSTDOUT:\n{}\nSTDERR:\n{}", job.state, job.exit_code, job.stdout, job.stderr)}], "isError": false}),
+                ),
+            },
+            None => error_response(id, -32602, "Unknown job_id"),
+        };
     }
+
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(cmd) if !cmd.is_empty() => cmd.to_owned(),
         _ => return error_response(id, -32602, "Missing command argument"),
     };
+
+    if name == "bash_exec_async" {
+        let (job_id, _) = match jobs.create() {
+            Some(v) => v,
+            None => return error_response(id, -32000, "Too many background jobs"),
+        };
+        let jobs_clone = jobs.clone();
+        let job_id_clone = job_id.clone();
+        tokio::spawn(async move {
+            let result = execute_command(&command).await;
+            let status = match result {
+                Ok((exit_code, stdout, stderr)) => JobStatus {
+                    state: "completed",
+                    exit_code: Some(exit_code),
+                    stdout,
+                    stderr,
+                },
+                Err(message) => JobStatus {
+                    state: "failed",
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: message,
+                },
+            };
+            jobs_clone.update(&job_id_clone, status);
+        });
+        return JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            error: None,
+            result: Some(
+                json!({"content":[{"type":"text","text":format!("job_id={}\nstate=running", job_id)}], "isError": false}),
+            ),
+        };
+    }
+
+    if name != "bash_exec" {
+        return error_response(id, -32602, "Unknown tool");
+    }
 
     let mut child = match Command::new("setsid")
         .arg("bash")
