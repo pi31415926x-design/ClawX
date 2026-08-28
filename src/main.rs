@@ -287,12 +287,12 @@ async fn handle_tool_call(id: Value, params: Option<Value>) -> JsonRpcResponse {
         stdout_data,
         stderr_data
     );
+    // Avoid duplicating potentially large stdout/stderr in structuredContent.
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id: Some(id),
         result: Some(json!({
             "content": [{"type": "text", "text": combined}],
-            "structuredContent": {"exit_code": status.code().unwrap_or(-1), "stdout": stdout_data, "stderr": stderr_data},
             "isError": !status.success()
         })),
         error: None,
