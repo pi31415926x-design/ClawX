@@ -11,6 +11,9 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
 /// Commands get killed (see `kill_on_drop` below) and turned into a timeout
 /// error if they run longer than this, so a single hung `bash_exec` call
 /// can't pin a task (and its process) forever.
@@ -303,17 +306,99 @@ fn error_response(id: Value, code: i64, message: impl Into<String>) -> JsonRpcRe
     }
 }
 
+/// Builds the platform shell invocation for a user-supplied command string.
+///
+/// Unix: `setsid bash -c <command>` -- `setsid` puts the whole command tree
+/// in a fresh process group so it can be signalled as a unit on timeout.
+///
+/// Windows: `powershell.exe -Command <command>`. There is no setsid
+/// equivalent; process-tree cleanup on timeout is instead handled with a
+/// Job Object (see `attach_job`/`terminate_tree` below). The server process
+/// itself is expected to already be running elevated (as a service under
+/// LocalSystem/an admin account, or a scheduled task set to "run with
+/// highest privileges") -- child processes simply inherit that token, there
+/// is no per-command elevation step.
+fn build_shell_command(command: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let mut c = Command::new("setsid");
+        c.arg("bash").arg("-c").arg(command);
+        c
+    }
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("powershell.exe");
+        c.arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(command);
+        c
+    }
+}
+
+/// Windows-only: assigns a freshly spawned child to a new Job Object so
+/// that terminating the job also terminates any processes the command
+/// spawns, not just the top-level `powershell.exe`. Returns `None` (and
+/// logs) on failure -- callers still fall back to `child.kill()`, which at
+/// least kills the top-level process.
+#[cfg(windows)]
+fn attach_job(child: &tokio::process::Child) -> Option<win32job::Job> {
+    let job = match win32job::Job::create() {
+        Ok(job) => job,
+        Err(e) => {
+            eprintln!("mcp-shell-server: failed to create job object: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = job.assign_process(child.as_raw_handle() as _) {
+        eprintln!("mcp-shell-server: failed to assign process to job object: {e}");
+        return None;
+    }
+    Some(job)
+}
+
+/// Best-effort termination of a timed-out command's whole process tree.
+/// Unix uses the process group created by `setsid` + `pkill -TERM -s <pid>`;
+/// Windows uses the Job Object attached at spawn time, if any.
+async fn terminate_tree(
+    child: &mut tokio::process::Child,
+    #[cfg(windows)] job: &Option<win32job::Job>,
+) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            let _ = Command::new("pkill")
+                .arg("-TERM")
+                .arg("-s")
+                .arg(pid.to_string())
+                .output()
+                .await;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(job) = job {
+            let _ = job.terminate(1);
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 async fn execute_command(command: &str) -> std::result::Result<(i32, String, String), String> {
-    let mut child = Command::new("setsid")
-        .arg("bash")
-        .arg("-c")
-        .arg(command)
+    let mut child = build_shell_command(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("Execution failed: {e}"))?;
+
+    #[cfg(windows)]
+    let job = attach_job(&child);
+
     let stdout = child
         .stdout
         .take()
@@ -328,16 +413,12 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("Execution failed: {e}")),
         Err(_) => {
-            if let Some(pid) = child.id() {
-                let _ = Command::new("pkill")
-                    .arg("-TERM")
-                    .arg("-s")
-                    .arg(pid.to_string())
-                    .output()
-                    .await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            terminate_tree(
+                &mut child,
+                #[cfg(windows)]
+                &job,
+            )
+            .await;
             stdout_task.abort();
             stderr_task.abort();
             return Err(format!(
@@ -427,73 +508,26 @@ async fn handle_tool_call(
         return error_response(id, -32602, "Unknown tool");
     }
 
-    let mut child = match Command::new("setsid")
-        .arg("bash")
-        .arg("-c")
-        .arg(&command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return error_response(id, -32000, format!("Execution failed: {e}")),
-    };
-
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_task = tokio::spawn(read_limited(stdout, MAX_OUTPUT_BYTES));
-    let stderr_task = tokio::spawn(read_limited(stderr, MAX_OUTPUT_BYTES));
-
-    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return error_response(id, -32000, format!("Execution failed: {e}")),
-        Err(_) => {
-            if let Some(pid) = child.id() {
-                let _ = Command::new("pkill")
-                    .arg("-TERM")
-                    .arg("-s")
-                    .arg(pid.to_string())
-                    .output()
-                    .await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
-            return error_response(
-                id,
-                -32000,
-                format!("Execution timed out after {}s", COMMAND_TIMEOUT.as_secs()),
+    // Delegates to the same platform-aware spawn/timeout/kill logic used by
+    // the async job path, instead of duplicating it here per-platform.
+    match execute_command(&command).await {
+        Ok((exit_code, stdout_data, stderr_data)) => {
+            let combined = format!(
+                "Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+                exit_code, stdout_data, stderr_data
             );
+            // Avoid duplicating potentially large stdout/stderr in structuredContent.
+            JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id),
+                result: Some(json!({
+                    "content": [{"type": "text", "text": combined}],
+                    "isError": exit_code != 0
+                })),
+                error: None,
+            }
         }
-    };
-
-    let stdout_data = match stdout_task.await {
-        Ok(Ok(v)) => v,
-        _ => String::new(),
-    };
-    let stderr_data = match stderr_task.await {
-        Ok(Ok(v)) => v,
-        _ => String::new(),
-    };
-
-    let combined = format!(
-        "Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-        status.code().unwrap_or(-1),
-        stdout_data,
-        stderr_data
-    );
-    // Avoid duplicating potentially large stdout/stderr in structuredContent.
-    JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        id: Some(id),
-        result: Some(json!({
-            "content": [{"type": "text", "text": combined}],
-            "isError": !status.success()
-        })),
-        error: None,
+        Err(message) => error_response(id, -32000, message),
     }
 }
 
