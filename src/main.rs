@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
 /// Commands get killed (see `kill_on_drop` below) and turned into a timeout
 /// error if they run longer than this, so a single hung `bash_exec` call
@@ -352,7 +352,11 @@ fn attach_job(child: &tokio::process::Child) -> Option<win32job::Job> {
             return None;
         }
     };
-    if let Err(e) = job.assign_process(child.as_raw_handle() as _) {
+    let Some(proc_handle) = child.raw_handle() else {
+        eprintln!("mcp-shell-server: child has no process handle");
+        return None;
+    };
+    if let Err(e) = job.assign_process(proc_handle as isize) {
         eprintln!("mcp-shell-server: failed to assign process to job object: {e}");
         return None;
     }
@@ -380,7 +384,9 @@ async fn terminate_tree(
     #[cfg(windows)]
     {
         if let Some(job) = job {
-            let _ = job.terminate(1);
+            unsafe {
+                let _ = TerminateJobObject(job.handle() as _, 1);
+            }
         }
     }
     let _ = child.kill().await;
