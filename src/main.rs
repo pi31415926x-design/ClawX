@@ -1,4 +1,5 @@
 use anyhow::Result;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// any of them finish.
 const MAX_IN_FLIGHT: usize = 16;
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const RESPONSE_QUEUE_SIZE: usize = 128;
 const MAX_JOBS: usize = 64;
 
@@ -283,6 +285,20 @@ async fn dispatch(
                             "required": ["job_id"]
                         }
                     }
+                    ,{
+                        "name": "read_image",
+                        "description": "Read a local image file and return it as MCP image content. Supports JPEG, PNG and WebP.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Absolute or relative local path to an image file"
+                                }
+                            },
+                            "required": ["path"]
+                        }
+                    }
                 ]
             })),
             error: None,
@@ -444,6 +460,71 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
     Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
+async fn handle_read_image(id: Value, args: &Value) -> JsonRpcResponse {
+    let path_str = match args.get("path").and_then(|v| v.as_str()) {
+        Some(path) if !path.is_empty() => path,
+        _ => return error_response(id, -32602, "Missing path argument"),
+    };
+
+    let path = std::path::Path::new(path_str);
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(m) => m,
+        Err(e) => return error_response(id, -32000, format!("Cannot stat image: {e}")),
+    };
+
+    if !metadata.is_file() {
+        return error_response(id, -32602, "Path is not a file");
+    }
+
+    let size = metadata.len() as usize;
+    if size > MAX_IMAGE_BYTES {
+        return error_response(
+            id,
+            -32602,
+            format!("Image is too large: {size} bytes (max {MAX_IMAGE_BYTES})"),
+        );
+    }
+
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => {
+            return error_response(
+                id,
+                -32602,
+                "Unsupported image type; use jpg, jpeg, png or webp",
+            )
+        }
+    };
+
+    let data = match tokio::fs::read(path).await {
+        Ok(data) => data,
+        Err(e) => return error_response(id, -32000, format!("Cannot read image: {e}")),
+    };
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: Some(id),
+        result: Some(json!({
+            "content": [{
+                "type": "image",
+                "data": encoded,
+                "mimeType": mime
+            }],
+            "isError": false
+        })),
+        error: None,
+    }
+}
+
 async fn handle_tool_call(
     id: Value,
     params: Option<Value>,
@@ -452,6 +533,10 @@ async fn handle_tool_call(
     let params = params.unwrap_or_default();
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_default();
+    if name == "read_image" {
+        return handle_read_image(id, &args).await;
+    }
+
     if name == "bash_job_status" {
         let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
             Some(v) if !v.is_empty() => v,
