@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinError, JoinSet};
@@ -105,15 +106,153 @@ struct JsonRpcResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut reader = BufReader::new(stdin()).lines();
+    let args: Vec<String> = std::env::args().collect();
+    let mut host_id: Option<String> = None;
+    let mut dispatcher: Option<String> = None;
+    let mut token: Option<String> = None;
 
-    // A single dedicated writer task owns stdout and is the only thing
-    // that ever writes to it. Requests are handled concurrently below, so
-    // without this, two tasks finishing at the same moment could interleave
-    // their writes and corrupt the JSON-RPC stream on the wire.
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host-id" => {
+                i += 1;
+                host_id = args.get(i).cloned();
+            }
+            "--dispatcher" => {
+                i += 1;
+                dispatcher = args.get(i).cloned();
+            }
+            "--token" => {
+                i += 1;
+                token = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("mcp-shell-server: ignoring unknown argument '{other}'");
+            }
+        }
+        i += 1;
+    }
+
+    match (host_id, dispatcher) {
+        (Some(host_id), Some(dispatcher)) => {
+            let token = token
+                .or_else(|| std::env::var("MCP_SHELL_TOKEN").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires a token: pass --token or set MCP_SHELL_TOKEN"
+                    )
+                })?;
+            run_registered(&dispatcher, &host_id, &token).await
+        }
+        (None, None) => run_stdio().await,
+        _ => Err(anyhow::anyhow!(
+            "--host-id and --dispatcher must be given together to enable registration mode"
+        )),
+    }
+}
+
+/// Local stdio mode: reads JSON-RPC requests from stdin, writes responses
+/// to stdout. This is the original transport, unchanged, and remains the
+/// default so a plain `mcp-proxy`-spawned child process keeps working
+/// exactly as before.
+async fn run_stdio() -> Result<()> {
+    let reader = BufReader::new(stdin());
+    let writer = stdout();
+    serve(reader, writer).await
+}
+
+/// Registration mode: dial out to `dispatcher`, identify as `host_id`, and
+/// once accepted, serve requests over that TCP connection instead of
+/// stdio. Reconnects with a capped backoff whenever the connection drops,
+/// so a dispatcher restart or a network blip doesn't require restarting
+/// this process by hand.
+async fn run_registered(dispatcher: &str, host_id: &str, token: &str) -> Result<()> {
+    const BACKOFF_STEPS_SECS: [u64; 4] = [1, 2, 5, 10];
+    let mut backoff_idx = 0usize;
+
+    loop {
+        match register_and_serve(dispatcher, host_id, token).await {
+            Ok(()) => {
+                eprintln!("mcp-shell-server: dispatcher connection closed, reconnecting");
+            }
+            Err(e) => {
+                eprintln!("mcp-shell-server: registration failed: {e}");
+            }
+        }
+
+        let delay = BACKOFF_STEPS_SECS[backoff_idx.min(BACKOFF_STEPS_SECS.len() - 1)];
+        backoff_idx += 1;
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+/// One connection attempt: connect, send the registration frame (see
+/// PROTOCOL.md), wait for the dispatcher's response, and on success hand
+/// off to `serve`. Returns `Ok(())` if the connection was accepted and
+/// later closed cleanly by the peer (EOF), or `Err` for anything that
+/// went wrong before or during the handshake.
+async fn register_and_serve(dispatcher: &str, host_id: &str, token: &str) -> Result<()> {
+    let stream = TcpStream::connect(dispatcher).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let register_frame = json!({
+        "type": "register",
+        "version": 1,
+        "host_id": host_id,
+        "token": token,
+    });
+    let mut line = serde_json::to_string(&register_frame)?;
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+
+    let mut response_line = String::new();
+    let bytes_read = reader.read_line(&mut response_line).await?;
+    if bytes_read == 0 {
+        anyhow::bail!("dispatcher closed the connection before responding to registration");
+    }
+
+    let response: Value = serde_json::from_str(response_line.trim())?;
+    match response.get("type").and_then(Value::as_str) {
+        Some("registered") => {
+            eprintln!(
+                "mcp-shell-server: registered as '{host_id}' with dispatcher {dispatcher}"
+            );
+        }
+        Some("error") => {
+            let reason = response
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("dispatcher rejected registration: {reason}");
+        }
+        _ => anyhow::bail!("unexpected registration response: {response}"),
+    }
+
+    serve(reader, write_half).await
+}
+
+/// Core JSON-RPC loop shared by both transports: reads newline-delimited
+/// requests from `reader`, dispatches each onto its own task (bounded by
+/// `MAX_IN_FLIGHT`), and writes newline-delimited responses to `writer`
+/// via a single dedicated writer task so concurrent handlers can never
+/// interleave their writes on the wire.
+async fn serve<R, W>(reader: R, writer: W) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut reader = reader.lines();
+
+    // A single dedicated writer task owns the output side and is the only
+    // thing that ever writes to it. Requests are handled concurrently
+    // below, so without this, two tasks finishing at the same moment
+    // could interleave their writes and corrupt the JSON-RPC stream on
+    // the wire.
     let (tx, mut rx) = mpsc::channel::<String>(RESPONSE_QUEUE_SIZE);
     let writer_task = tokio::spawn(async move {
-        let mut writer = stdout();
+        let mut writer = writer;
         while let Some(mut out) = rx.recv().await {
             out.push('\n');
             if let Err(e) = writer.write_all(out.as_bytes()).await {
@@ -121,7 +260,7 @@ async fn main() -> Result<()> {
                 break;
             }
             if let Err(e) = writer.flush().await {
-                eprintln!("mcp-shell-server: failed to flush stdout: {e}");
+                eprintln!("mcp-shell-server: failed to flush output: {e}");
                 break;
             }
         }
@@ -190,7 +329,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Stdin closed. Drain every still-running request instead of dropping
+    // Input closed. Drain every still-running request instead of dropping
     // their JoinHandles, so a handler that was mid-flight gets to send its
     // response (or have its panic logged) before we exit.
     while let Some(res) = in_flight.join_next().await {
