@@ -26,6 +26,12 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RESPONSE_QUEUE_SIZE: usize = 128;
 const MAX_JOBS: usize = 64;
 
+/// The full set of tool names this binary can ever implement. A node's
+/// --tools flag (registration mode only) must be a subset of this list --
+/// it declares which of these the node is willing to expose, it can never
+/// grant a tool that doesn't exist.
+const KNOWN_TOOLS: &[&str] = &["bash_exec", "bash_exec_async", "bash_job_status"];
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -107,16 +113,17 @@ struct JsonRpcResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let mut host_id: Option<String> = None;
+    let mut node_id: Option<String> = None;
     let mut dispatcher: Option<String> = None;
     let mut token: Option<String> = None;
+    let mut tools_arg: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--host-id" => {
+            "--node-id" => {
                 i += 1;
-                host_id = args.get(i).cloned();
+                node_id = args.get(i).cloned();
             }
             "--dispatcher" => {
                 i += 1;
@@ -126,6 +133,10 @@ async fn main() -> Result<()> {
                 i += 1;
                 token = args.get(i).cloned();
             }
+            "--tools" => {
+                i += 1;
+                tools_arg = args.get(i).cloned();
+            }
             other => {
                 eprintln!("mcp-shell-server: ignoring unknown argument '{other}'");
             }
@@ -133,8 +144,8 @@ async fn main() -> Result<()> {
         i += 1;
     }
 
-    match (host_id, dispatcher) {
-        (Some(host_id), Some(dispatcher)) => {
+    match (node_id, dispatcher) {
+        (Some(node_id), Some(dispatcher)) => {
             let token = token
                 .or_else(|| std::env::var("MCP_SHELL_TOKEN").ok())
                 .ok_or_else(|| {
@@ -142,13 +153,41 @@ async fn main() -> Result<()> {
                         "registration mode requires a token: pass --token or set MCP_SHELL_TOKEN"
                     )
                 })?;
-            run_registered(&dispatcher, &host_id, &token).await
+            let tools = parse_tools(tools_arg.as_deref())?;
+            run_registered(&dispatcher, &node_id, &tools, &token).await
         }
         (None, None) => run_stdio().await,
         _ => Err(anyhow::anyhow!(
-            "--host-id and --dispatcher must be given together to enable registration mode"
+            "--node-id and --dispatcher must be given together to enable registration mode"
         )),
     }
+}
+
+/// Parses a comma-separated --tools value into a validated list. Rejecting
+/// unknown names here (rather than letting the dispatcher discover it
+/// later) means a typo fails fast, locally, before ever touching the
+/// network -- the same "fail before you commit" instinct as validating a
+/// config file before starting a service. Absent flag or empty string
+/// means "expose nothing": the node registers and shows up as online, but
+/// isn't a valid target for any tool call.
+fn parse_tools(raw: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            if KNOWN_TOOLS.contains(&name) {
+                Ok(name.to_string())
+            } else {
+                Err(anyhow::anyhow!(
+                    "unknown tool '{name}' in --tools (known tools: {})",
+                    KNOWN_TOOLS.join(", ")
+                ))
+            }
+        })
+        .collect()
 }
 
 /// Local stdio mode: reads JSON-RPC requests from stdin, writes responses
@@ -161,17 +200,22 @@ async fn run_stdio() -> Result<()> {
     serve(reader, writer).await
 }
 
-/// Registration mode: dial out to `dispatcher`, identify as `host_id`, and
-/// once accepted, serve requests over that TCP connection instead of
-/// stdio. Reconnects with a capped backoff whenever the connection drops,
-/// so a dispatcher restart or a network blip doesn't require restarting
-/// this process by hand.
-async fn run_registered(dispatcher: &str, host_id: &str, token: &str) -> Result<()> {
+/// Registration mode: dial out to `dispatcher`, identify as `node_id`
+/// exposing `tools`, and once accepted, serve requests over that TCP
+/// connection instead of stdio. Reconnects with a capped backoff whenever
+/// the connection drops, so a dispatcher restart or a network blip
+/// doesn't require restarting this process by hand.
+async fn run_registered(
+    dispatcher: &str,
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+) -> Result<()> {
     const BACKOFF_STEPS_SECS: [u64; 4] = [1, 2, 5, 10];
     let mut backoff_idx = 0usize;
 
     loop {
-        match register_and_serve(dispatcher, host_id, token).await {
+        match register_and_serve(dispatcher, node_id, tools, token).await {
             Ok(()) => {
                 eprintln!("mcp-shell-server: dispatcher connection closed, reconnecting");
             }
@@ -186,20 +230,26 @@ async fn run_registered(dispatcher: &str, host_id: &str, token: &str) -> Result<
     }
 }
 
-/// One connection attempt: connect, send the registration frame (see
-/// PROTOCOL.md), wait for the dispatcher's response, and on success hand
-/// off to `serve`. Returns `Ok(())` if the connection was accepted and
-/// later closed cleanly by the peer (EOF), or `Err` for anything that
-/// went wrong before or during the handshake.
-async fn register_and_serve(dispatcher: &str, host_id: &str, token: &str) -> Result<()> {
+/// One connection attempt: connect, send the registration frame (protocol
+/// v2, see docs/PROTOCOL.md), wait for the dispatcher's response, and on
+/// success hand off to `serve`. Returns `Ok(())` if the connection was
+/// accepted and later closed cleanly by the peer (EOF), or `Err` for
+/// anything that went wrong before or during the handshake.
+async fn register_and_serve(
+    dispatcher: &str,
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+) -> Result<()> {
     let stream = TcpStream::connect(dispatcher).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
     let register_frame = json!({
         "type": "register",
-        "version": 1,
-        "host_id": host_id,
+        "version": 2,
+        "node_id": node_id,
+        "tools": tools,
         "token": token,
     });
     let mut line = serde_json::to_string(&register_frame)?;
@@ -217,7 +267,8 @@ async fn register_and_serve(dispatcher: &str, host_id: &str, token: &str) -> Res
     match response.get("type").and_then(Value::as_str) {
         Some("registered") => {
             eprintln!(
-                "mcp-shell-server: registered as '{host_id}' with dispatcher {dispatcher}"
+                "mcp-shell-server: registered as '{node_id}' (tools: {}) with dispatcher {dispatcher}",
+                tools.join(", ")
             );
         }
         Some("error") => {
