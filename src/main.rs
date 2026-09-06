@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -242,6 +243,9 @@ async fn register_and_serve(
     token: &str,
 ) -> Result<()> {
     let stream = TcpStream::connect(dispatcher).await?;
+    if let Err(e) = enable_tcp_keepalive(&stream) {
+        eprintln!("mcp-shell-server: failed to enable TCP keepalive: {e}");
+    }
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -282,6 +286,26 @@ async fn register_and_serve(
     }
 
     serve(reader, write_half).await
+}
+
+/// Sets a moderately aggressive OS-level TCP keepalive on the registration
+/// socket. This is deliberately NOT an application-level heartbeat frame --
+/// docs/PROTOCOL.md still has none, and this doesn't touch the wire
+/// protocol at all. It's a kernel feature that makes the "silence = still
+/// alive" assumption in `serve`'s read loop actually hold when a NAT/router
+/// somewhere in the path drops the connection's state without ever
+/// forwarding a FIN/RST to either side: without a keepalive probe, that
+/// kind of half-dead connection can sit forever, because the local socket
+/// never sees an error and nothing here ever notices the peer is gone.
+/// (Observed in practice testing registration across a DDNS/NAT path: a
+/// `tools/call` on a stale connection hung indefinitely even though
+/// `list_nodes` still reported the node online.)
+fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
 }
 
 /// Core JSON-RPC loop shared by both transports: reads newline-delimited
