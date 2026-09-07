@@ -308,8 +308,12 @@ async fn register_and_serve(
 fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(20))
-        .with_interval(Duration::from_secs(10))
-        .with_retries(3);
+        .with_interval(Duration::from_secs(10));
+    // Windows has no TCP_KEEPCNT-equivalent knob, so socket2 only exposes
+    // `with_retries` on Unix-like targets; Windows just uses its OS default
+    // retry count on top of the time/interval set above.
+    #[cfg(not(windows))]
+    let keepalive = keepalive.with_retries(3);
     SockRef::from(stream).set_tcp_keepalive(&keepalive)
 }
 
