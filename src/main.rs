@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
@@ -62,6 +62,128 @@ const EXEC_ASYNC_DESCRIPTION: &str =
 const JOB_STATUS_DESCRIPTION: &str = "Get the status and output of a background bash job";
 #[cfg(windows)]
 const JOB_STATUS_DESCRIPTION: &str = "Get the status and output of a background PowerShell job";
+
+/// Reserved tool name used only over the dispatcher<->node protocol
+/// connection (registration mode) to check the operator password the
+/// dispatcher's public `authenticate_node` meta-tool relays here. Never
+/// declared in `--tools`/`KNOWN_TOOLS`, never listed in `tools/list`: it's
+/// not a tool a caller can discover or invoke through the normal
+/// tools/call surface Claude sees, only something the dispatcher calls
+/// directly by name once it already knows to. The password itself never
+/// leaves this process -- the dispatcher only forwards what the user typed
+/// and relays back whether this call says it matched.
+const VERIFY_PASSWORD_TOOL: &str = "__verify_password__";
+
+/// How many consecutive wrong passwords are tolerated before this node
+/// stops even attempting a comparison for a while. Guards against a
+/// compromised dispatcher (or anyone who reaches this connection)
+/// brute-forcing the operator password; a real operator mistyping it a
+/// few times in a row is the expected/tolerated cost.
+const MAX_PASSWORD_ATTEMPTS: u32 = 5;
+const PASSWORD_LOCKOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Holds the operator password (registration mode only, set via
+/// `--operator-password`/`MCP_SHELL_OPERATOR_PASSWORD`) and a simple
+/// failure counter that locks out further attempts for a while after too
+/// many wrong guesses in a row. Never serialized, never sent anywhere --
+/// only compared against what `__verify_password__` calls hand it.
+struct PasswordGuard {
+    password: String,
+    state: Mutex<PasswordGuardState>,
+}
+
+#[derive(Default)]
+struct PasswordGuardState {
+    fail_count: u32,
+    locked_until: Option<Instant>,
+}
+
+enum PasswordCheck {
+    Ok,
+    WrongPassword,
+    LockedOut { retry_after_secs: u64 },
+}
+
+impl PasswordGuard {
+    fn new(password: String) -> Self {
+        Self {
+            password,
+            state: Mutex::new(PasswordGuardState::default()),
+        }
+    }
+
+    fn check(&self, candidate: &str) -> PasswordCheck {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(locked_until) = state.locked_until {
+            let now = Instant::now();
+            if now < locked_until {
+                return PasswordCheck::LockedOut {
+                    retry_after_secs: (locked_until - now).as_secs().max(1),
+                };
+            }
+            // Lockout window elapsed: give the operator a clean slate.
+            state.locked_until = None;
+            state.fail_count = 0;
+        }
+
+        if constant_time_eq(candidate, &self.password) {
+            state.fail_count = 0;
+            PasswordCheck::Ok
+        } else {
+            state.fail_count += 1;
+            if state.fail_count >= MAX_PASSWORD_ATTEMPTS {
+                state.locked_until = Some(Instant::now() + PASSWORD_LOCKOUT);
+                PasswordCheck::LockedOut {
+                    retry_after_secs: PASSWORD_LOCKOUT.as_secs(),
+                }
+            } else {
+                PasswordCheck::WrongPassword
+            }
+        }
+    }
+}
+
+/// Deliberately not early-exiting on the first mismatched byte, so how long
+/// this takes doesn't leak how many leading characters of a guess were
+/// right. Not a full defense on its own (network jitter dwarfs the
+/// difference this guards against), but it costs nothing to add and rules
+/// out the crudest timing side channel.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn handle_verify_password(id: Value, args: &Value, guard: Option<&PasswordGuard>) -> JsonRpcResponse {
+    let Some(guard) = guard else {
+        // stdio mode never sets up a guard; this tool has no meaning there.
+        return error_response(id, -32601, "password verification is not available in stdio mode");
+    };
+    let candidate = match args.get("password").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return error_response(id, -32602, "Missing password argument"),
+    };
+    let (text, is_error) = match guard.check(candidate) {
+        PasswordCheck::Ok => ("ok".to_string(), false),
+        PasswordCheck::WrongPassword => ("invalid password".to_string(), true),
+        PasswordCheck::LockedOut { retry_after_secs } => (
+            format!("too many failed attempts, locked for {retry_after_secs}s"),
+            true,
+        ),
+    };
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id: Some(id),
+        error: None,
+        result: Some(json!({"content": [{"type": "text", "text": text}], "isError": is_error})),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -148,6 +270,7 @@ async fn main() -> Result<()> {
     let mut dispatcher: Option<String> = None;
     let mut token: Option<String> = None;
     let mut tools_arg: Option<String> = None;
+    let mut operator_password: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -168,6 +291,10 @@ async fn main() -> Result<()> {
                 i += 1;
                 tools_arg = args.get(i).cloned();
             }
+            "--operator-password" => {
+                i += 1;
+                operator_password = args.get(i).cloned();
+            }
             other => {
                 eprintln!("mcp-shell-server: ignoring unknown argument '{other}'");
             }
@@ -184,8 +311,19 @@ async fn main() -> Result<()> {
                         "registration mode requires a token: pass --token or set MCP_SHELL_TOKEN"
                     )
                 })?;
+            let operator_password = operator_password
+                .or_else(|| std::env::var("MCP_SHELL_OPERATOR_PASSWORD").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires an operator password: pass \
+                         --operator-password or set MCP_SHELL_OPERATOR_PASSWORD -- this is the \
+                         password callers must supply via the dispatcher's authenticate_node \
+                         tool before this node will run anything for them"
+                    )
+                })?;
             let tools = parse_tools(tools_arg.as_deref())?;
-            run_registered(&dispatcher, &node_id, &tools, &token).await
+            let guard = Arc::new(PasswordGuard::new(operator_password));
+            run_registered(&dispatcher, &node_id, &tools, &token, guard).await
         }
         (None, None) => run_stdio().await,
         _ => Err(anyhow::anyhow!(
@@ -228,7 +366,7 @@ fn parse_tools(raw: Option<&str>) -> Result<Vec<String>> {
 async fn run_stdio() -> Result<()> {
     let reader = BufReader::new(stdin());
     let writer = stdout();
-    serve(reader, writer).await
+    serve(reader, writer, None).await
 }
 
 /// Registration mode: dial out to `dispatcher`, identify as `node_id`
@@ -241,12 +379,13 @@ async fn run_registered(
     node_id: &str,
     tools: &[String],
     token: &str,
+    guard: Arc<PasswordGuard>,
 ) -> Result<()> {
     const BACKOFF_STEPS_SECS: [u64; 4] = [1, 2, 5, 10];
     let mut backoff_idx = 0usize;
 
     loop {
-        match register_and_serve(dispatcher, node_id, tools, token).await {
+        match register_and_serve(dispatcher, node_id, tools, token, guard.clone()).await {
             Ok(()) => {
                 eprintln!("mcp-shell-server: dispatcher connection closed, reconnecting");
             }
@@ -271,6 +410,7 @@ async fn register_and_serve(
     node_id: &str,
     tools: &[String],
     token: &str,
+    guard: Arc<PasswordGuard>,
 ) -> Result<()> {
     let stream = TcpStream::connect(dispatcher).await?;
     if let Err(e) = enable_tcp_keepalive(&stream) {
@@ -315,7 +455,7 @@ async fn register_and_serve(
         _ => anyhow::bail!("unexpected registration response: {response}"),
     }
 
-    serve(reader, write_half).await
+    serve(reader, write_half, Some(guard)).await
 }
 
 /// Sets a moderately aggressive OS-level TCP keepalive on the registration
@@ -347,7 +487,7 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 /// `MAX_IN_FLIGHT`), and writes newline-delimited responses to `writer`
 /// via a single dedicated writer task so concurrent handlers can never
 /// interleave their writes on the wire.
-async fn serve<R, W>(reader: R, writer: W) -> Result<()>
+async fn serve<R, W>(reader: R, writer: W, guard: Option<Arc<PasswordGuard>>) -> Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -418,12 +558,13 @@ where
         let tx = tx.clone();
         let semaphore = semaphore.clone();
         let jobs_for_task = jobs.clone();
+        let guard_for_task = guard.clone();
         in_flight.spawn(async move {
             let permit = match semaphore.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
-            let response = dispatch(req_id, method, params, jobs_for_task).await;
+            let response = dispatch(req_id, method, params, jobs_for_task, guard_for_task).await;
             drop(permit);
             match serde_json::to_string(&response) {
                 Ok(out) => {
@@ -465,6 +606,7 @@ async fn dispatch(
     method: String,
     params: Option<Value>,
     jobs: Arc<JobStore>,
+    guard: Option<Arc<PasswordGuard>>,
 ) -> JsonRpcResponse {
     match method.as_str() {
         "initialize" => JsonRpcResponse {
@@ -546,7 +688,7 @@ async fn dispatch(
             })),
             error: None,
         },
-        "tools/call" => handle_tool_call(req_id, params, jobs).await,
+        "tools/call" => handle_tool_call(req_id, params, jobs, guard).await,
         _ => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: Some(req_id),
@@ -772,10 +914,14 @@ async fn handle_tool_call(
     id: Value,
     params: Option<Value>,
     jobs: Arc<JobStore>,
+    guard: Option<Arc<PasswordGuard>>,
 ) -> JsonRpcResponse {
     let params = params.unwrap_or_default();
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_default();
+    if name == VERIFY_PASSWORD_TOOL {
+        return handle_verify_password(id, &args, guard.as_deref());
+    }
     if name == "read_image" {
         return handle_read_image(id, &args).await;
     }
