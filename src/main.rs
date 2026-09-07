@@ -38,6 +38,31 @@ const MAX_JOBS: usize = 64;
 /// grant a tool that doesn't exist.
 const KNOWN_TOOLS: &[&str] = &["bash_exec", "bash_exec_async", "bash_job_status"];
 
+/// `tools/list` descriptions are platform-specific because the underlying
+/// shell is: `build_shell_command` runs `bash -c` on Unix but
+/// `powershell.exe -Command` on Windows (see there for why). The wording
+/// here is the only thing standing between a caller and writing bash syntax
+/// against a node that's actually running PowerShell, so it says which
+/// shell it is rather than reusing the generic "bash" name across
+/// platforms.
+#[cfg(unix)]
+const EXEC_DESCRIPTION: &str = "Execute a bash command safely on the host";
+#[cfg(windows)]
+const EXEC_DESCRIPTION: &str =
+    "Execute a PowerShell command safely on the host (runs via `powershell.exe -Command`; use PowerShell syntax, not bash/cmd)";
+
+#[cfg(unix)]
+const EXEC_ASYNC_DESCRIPTION: &str =
+    "Start a bash command in the background and return immediately with a job_id";
+#[cfg(windows)]
+const EXEC_ASYNC_DESCRIPTION: &str =
+    "Start a PowerShell command in the background and return immediately with a job_id (runs via `powershell.exe -Command`; use PowerShell syntax, not bash/cmd)";
+
+#[cfg(unix)]
+const JOB_STATUS_DESCRIPTION: &str = "Get the status and output of a background bash job";
+#[cfg(windows)]
+const JOB_STATUS_DESCRIPTION: &str = "Get the status and output of a background PowerShell job";
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -464,7 +489,7 @@ async fn dispatch(
                 "tools": [
                     {
                         "name": "bash_exec",
-                        "description": "Execute a bash command safely on the host",
+                        "description": EXEC_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -487,7 +512,7 @@ async fn dispatch(
                     },
                     {
                         "name": "bash_exec_async",
-                        "description": "Start a bash command in the background and return immediately with a job_id",
+                        "description": EXEC_ASYNC_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {"command": {"type": "string"}},
@@ -496,7 +521,7 @@ async fn dispatch(
                     },
                     {
                         "name": "bash_job_status",
-                        "description": "Get the status and output of a background bash job",
+                        "description": JOB_STATUS_DESCRIPTION,
                         "inputSchema": {
                             "type": "object",
                             "properties": {"job_id": {"type": "string"}},
