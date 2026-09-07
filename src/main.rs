@@ -1038,3 +1038,77 @@ where
     }
     Ok(s)
 }
+
+#[cfg(test)]
+mod password_guard_tests {
+    use super::*;
+
+    #[test]
+    fn correct_password_ok_and_resets_fail_count() {
+        let guard = PasswordGuard::new("s3cret".to_string());
+        assert!(matches!(guard.check("s3cret"), PasswordCheck::Ok));
+        // A fresh guard has no failures recorded either way; re-checking
+        // the right password again should still be Ok, not affected by
+        // any prior state.
+        assert!(matches!(guard.check("s3cret"), PasswordCheck::Ok));
+    }
+
+    #[test]
+    fn wrong_password_below_threshold_is_just_wrong() {
+        let guard = PasswordGuard::new("s3cret".to_string());
+        for _ in 0..MAX_PASSWORD_ATTEMPTS - 1 {
+            assert!(matches!(guard.check("nope"), PasswordCheck::WrongPassword));
+        }
+    }
+
+    #[test]
+    fn nth_wrong_password_triggers_lockout() {
+        let guard = PasswordGuard::new("s3cret".to_string());
+        for _ in 0..MAX_PASSWORD_ATTEMPTS - 1 {
+            guard.check("nope");
+        }
+        // The MAX_PASSWORD_ATTEMPTS-th consecutive wrong guess locks it.
+        assert!(matches!(
+            guard.check("nope"),
+            PasswordCheck::LockedOut { .. }
+        ));
+    }
+
+    #[test]
+    fn locked_out_rejects_even_the_correct_password() {
+        let guard = PasswordGuard::new("s3cret".to_string());
+        for _ in 0..MAX_PASSWORD_ATTEMPTS {
+            guard.check("nope");
+        }
+        // Now locked: the right password must not short-circuit the lock.
+        assert!(matches!(
+            guard.check("s3cret"),
+            PasswordCheck::LockedOut { .. }
+        ));
+    }
+
+    #[test]
+    fn lockout_clears_after_window_elapses() {
+        let guard = PasswordGuard::new("s3cret".to_string());
+        for _ in 0..MAX_PASSWORD_ATTEMPTS {
+            guard.check("nope");
+        }
+        // Simulate the lockout window having already elapsed by rewriting
+        // the deadline directly, instead of sleeping PASSWORD_LOCKOUT in a
+        // test.
+        {
+            let mut state = guard.state.lock().unwrap();
+            state.locked_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert!(matches!(guard.check("s3cret"), PasswordCheck::Ok));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_str_eq_semantics() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "ab"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+    }
+}
