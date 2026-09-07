@@ -2,12 +2,14 @@ use anyhow::Result;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinError, JoinSet};
@@ -29,6 +31,12 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const RESPONSE_QUEUE_SIZE: usize = 128;
 const MAX_JOBS: usize = 64;
+
+/// The full set of tool names this binary can ever implement. A node's
+/// --tools flag (registration mode only) must be a subset of this list --
+/// it declares which of these the node is willing to expose, it can never
+/// grant a tool that doesn't exist.
+const KNOWN_TOOLS: &[&str] = &["bash_exec", "bash_exec_async", "bash_job_status"];
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -110,15 +118,221 @@ struct JsonRpcResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut reader = BufReader::new(stdin()).lines();
+    let args: Vec<String> = std::env::args().collect();
+    let mut node_id: Option<String> = None;
+    let mut dispatcher: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut tools_arg: Option<String> = None;
 
-    // A single dedicated writer task owns stdout and is the only thing
-    // that ever writes to it. Requests are handled concurrently below, so
-    // without this, two tasks finishing at the same moment could interleave
-    // their writes and corrupt the JSON-RPC stream on the wire.
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--node-id" => {
+                i += 1;
+                node_id = args.get(i).cloned();
+            }
+            "--dispatcher" => {
+                i += 1;
+                dispatcher = args.get(i).cloned();
+            }
+            "--token" => {
+                i += 1;
+                token = args.get(i).cloned();
+            }
+            "--tools" => {
+                i += 1;
+                tools_arg = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("mcp-shell-server: ignoring unknown argument '{other}'");
+            }
+        }
+        i += 1;
+    }
+
+    match (node_id, dispatcher) {
+        (Some(node_id), Some(dispatcher)) => {
+            let token = token
+                .or_else(|| std::env::var("MCP_SHELL_TOKEN").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires a token: pass --token or set MCP_SHELL_TOKEN"
+                    )
+                })?;
+            let tools = parse_tools(tools_arg.as_deref())?;
+            run_registered(&dispatcher, &node_id, &tools, &token).await
+        }
+        (None, None) => run_stdio().await,
+        _ => Err(anyhow::anyhow!(
+            "--node-id and --dispatcher must be given together to enable registration mode"
+        )),
+    }
+}
+
+/// Parses a comma-separated --tools value into a validated list. Rejecting
+/// unknown names here (rather than letting the dispatcher discover it
+/// later) means a typo fails fast, locally, before ever touching the
+/// network -- the same "fail before you commit" instinct as validating a
+/// config file before starting a service. Absent flag or empty string
+/// means "expose nothing": the node registers and shows up as online, but
+/// isn't a valid target for any tool call.
+fn parse_tools(raw: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            if KNOWN_TOOLS.contains(&name) {
+                Ok(name.to_string())
+            } else {
+                Err(anyhow::anyhow!(
+                    "unknown tool '{name}' in --tools (known tools: {})",
+                    KNOWN_TOOLS.join(", ")
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Local stdio mode: reads JSON-RPC requests from stdin, writes responses
+/// to stdout. This is the original transport, unchanged, and remains the
+/// default so a plain `mcp-proxy`-spawned child process keeps working
+/// exactly as before.
+async fn run_stdio() -> Result<()> {
+    let reader = BufReader::new(stdin());
+    let writer = stdout();
+    serve(reader, writer).await
+}
+
+/// Registration mode: dial out to `dispatcher`, identify as `node_id`
+/// exposing `tools`, and once accepted, serve requests over that TCP
+/// connection instead of stdio. Reconnects with a capped backoff whenever
+/// the connection drops, so a dispatcher restart or a network blip
+/// doesn't require restarting this process by hand.
+async fn run_registered(
+    dispatcher: &str,
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+) -> Result<()> {
+    const BACKOFF_STEPS_SECS: [u64; 4] = [1, 2, 5, 10];
+    let mut backoff_idx = 0usize;
+
+    loop {
+        match register_and_serve(dispatcher, node_id, tools, token).await {
+            Ok(()) => {
+                eprintln!("mcp-shell-server: dispatcher connection closed, reconnecting");
+            }
+            Err(e) => {
+                eprintln!("mcp-shell-server: registration failed: {e}");
+            }
+        }
+
+        let delay = BACKOFF_STEPS_SECS[backoff_idx.min(BACKOFF_STEPS_SECS.len() - 1)];
+        backoff_idx += 1;
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+/// One connection attempt: connect, send the registration frame (protocol
+/// v2, see docs/PROTOCOL.md), wait for the dispatcher's response, and on
+/// success hand off to `serve`. Returns `Ok(())` if the connection was
+/// accepted and later closed cleanly by the peer (EOF), or `Err` for
+/// anything that went wrong before or during the handshake.
+async fn register_and_serve(
+    dispatcher: &str,
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+) -> Result<()> {
+    let stream = TcpStream::connect(dispatcher).await?;
+    if let Err(e) = enable_tcp_keepalive(&stream) {
+        eprintln!("mcp-shell-server: failed to enable TCP keepalive: {e}");
+    }
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let register_frame = json!({
+        "type": "register",
+        "version": 2,
+        "node_id": node_id,
+        "tools": tools,
+        "token": token,
+    });
+    let mut line = serde_json::to_string(&register_frame)?;
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+
+    let mut response_line = String::new();
+    let bytes_read = reader.read_line(&mut response_line).await?;
+    if bytes_read == 0 {
+        anyhow::bail!("dispatcher closed the connection before responding to registration");
+    }
+
+    let response: Value = serde_json::from_str(response_line.trim())?;
+    match response.get("type").and_then(Value::as_str) {
+        Some("registered") => {
+            eprintln!(
+                "mcp-shell-server: registered as '{node_id}' (tools: {}) with dispatcher {dispatcher}",
+                tools.join(", ")
+            );
+        }
+        Some("error") => {
+            let reason = response
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("dispatcher rejected registration: {reason}");
+        }
+        _ => anyhow::bail!("unexpected registration response: {response}"),
+    }
+
+    serve(reader, write_half).await
+}
+
+/// Sets a moderately aggressive OS-level TCP keepalive on the registration
+/// socket. This is deliberately NOT an application-level heartbeat frame --
+/// docs/PROTOCOL.md still has none, and this doesn't touch the wire
+/// protocol at all. It's a kernel feature that makes the "silence = still
+/// alive" assumption in `serve`'s read loop actually hold when a NAT/router
+/// somewhere in the path drops the connection's state without ever
+/// forwarding a FIN/RST to either side: without a keepalive probe, that
+/// kind of half-dead connection can sit forever, because the local socket
+/// never sees an error and nothing here ever notices the peer is gone.
+/// (Observed in practice testing registration across a DDNS/NAT path: a
+/// `tools/call` on a stale connection hung indefinitely even though
+/// `list_nodes` still reported the node online.)
+fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// Core JSON-RPC loop shared by both transports: reads newline-delimited
+/// requests from `reader`, dispatches each onto its own task (bounded by
+/// `MAX_IN_FLIGHT`), and writes newline-delimited responses to `writer`
+/// via a single dedicated writer task so concurrent handlers can never
+/// interleave their writes on the wire.
+async fn serve<R, W>(reader: R, writer: W) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut reader = reader.lines();
+
+    // A single dedicated writer task owns the output side and is the only
+    // thing that ever writes to it. Requests are handled concurrently
+    // below, so without this, two tasks finishing at the same moment
+    // could interleave their writes and corrupt the JSON-RPC stream on
+    // the wire.
     let (tx, mut rx) = mpsc::channel::<String>(RESPONSE_QUEUE_SIZE);
     let writer_task = tokio::spawn(async move {
-        let mut writer = stdout();
+        let mut writer = writer;
         while let Some(mut out) = rx.recv().await {
             out.push('\n');
             if let Err(e) = writer.write_all(out.as_bytes()).await {
@@ -126,7 +340,7 @@ async fn main() -> Result<()> {
                 break;
             }
             if let Err(e) = writer.flush().await {
-                eprintln!("mcp-shell-server: failed to flush stdout: {e}");
+                eprintln!("mcp-shell-server: failed to flush output: {e}");
                 break;
             }
         }
@@ -195,7 +409,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Stdin closed. Drain every still-running request instead of dropping
+    // Input closed. Drain every still-running request instead of dropping
     // their JoinHandles, so a handler that was mid-flight gets to send its
     // response (or have its panic logged) before we exit.
     while let Some(res) = in_flight.join_next().await {
