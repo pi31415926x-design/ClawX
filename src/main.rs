@@ -118,6 +118,8 @@ async fn main() -> Result<()> {
     let mut dispatcher: Option<String> = None;
     let mut token: Option<String> = None;
     let mut tools_arg: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut pwd: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -138,6 +140,14 @@ async fn main() -> Result<()> {
                 i += 1;
                 tools_arg = args.get(i).cloned();
             }
+            "--user" => {
+                i += 1;
+                user = args.get(i).cloned();
+            }
+            "--pwd" => {
+                i += 1;
+                pwd = args.get(i).cloned();
+            }
             other => {
                 eprintln!("mcp-shell-server: ignoring unknown argument '{other}'");
             }
@@ -154,8 +164,29 @@ async fn main() -> Result<()> {
                         "registration mode requires a token: pass --token or set MCP_SHELL_TOKEN"
                     )
                 })?;
+            // `user`/`pwd` identify which *person* this node belongs to
+            // (protocol v3, see docs/PROTOCOL.md) -- separate from
+            // `token`, which only answers "is this connection allowed to
+            // register at all". The dispatcher rejects registration
+            // outright (`missing_credentials`) if either is empty, so
+            // fail the same way locally rather than making a doomed round
+            // trip over the network first.
+            let user = user
+                .or_else(|| std::env::var("MCP_SHELL_USER").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires a user: pass --user or set MCP_SHELL_USER"
+                    )
+                })?;
+            let pwd = pwd
+                .or_else(|| std::env::var("MCP_SHELL_PWD").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires a pwd: pass --pwd or set MCP_SHELL_PWD"
+                    )
+                })?;
             let tools = parse_tools(tools_arg.as_deref())?;
-            run_registered(&dispatcher, &node_id, &tools, &token).await
+            run_registered(&dispatcher, &node_id, &tools, &token, &user, &pwd).await
         }
         (None, None) => run_stdio().await,
         _ => Err(anyhow::anyhow!(
@@ -202,7 +233,8 @@ async fn run_stdio() -> Result<()> {
 }
 
 /// Registration mode: dial out to `dispatcher`, identify as `node_id`
-/// exposing `tools`, and once accepted, serve requests over that TCP
+/// owned by `user` and exposing `tools`, and once accepted, serve requests
+/// over that TCP
 /// connection instead of stdio. Reconnects with a capped backoff whenever
 /// the connection drops, so a dispatcher restart or a network blip
 /// doesn't require restarting this process by hand.
@@ -211,12 +243,14 @@ async fn run_registered(
     node_id: &str,
     tools: &[String],
     token: &str,
+    user: &str,
+    pwd: &str,
 ) -> Result<()> {
     const BACKOFF_STEPS_SECS: [u64; 4] = [1, 2, 5, 10];
     let mut backoff_idx = 0usize;
 
     loop {
-        match register_and_serve(dispatcher, node_id, tools, token).await {
+        match register_and_serve(dispatcher, node_id, tools, token, user, pwd).await {
             Ok(()) => {
                 eprintln!("mcp-shell-server: dispatcher connection closed, reconnecting");
             }
@@ -231,8 +265,23 @@ async fn run_registered(
     }
 }
 
+/// Builds the registration frame (protocol v3, see docs/PROTOCOL.md).
+/// Pulled out of `register_and_serve` as a pure function so its shape can
+/// be unit tested without opening a real TCP connection.
+fn build_register_frame(node_id: &str, tools: &[String], token: &str, user: &str, pwd: &str) -> Value {
+    json!({
+        "type": "register",
+        "version": 3,
+        "node_id": node_id,
+        "tools": tools,
+        "token": token,
+        "user": user,
+        "pwd": pwd,
+    })
+}
+
 /// One connection attempt: connect, send the registration frame (protocol
-/// v2, see docs/PROTOCOL.md), wait for the dispatcher's response, and on
+/// v3, see docs/PROTOCOL.md), wait for the dispatcher's response, and on
 /// success hand off to `serve`. Returns `Ok(())` if the connection was
 /// accepted and later closed cleanly by the peer (EOF), or `Err` for
 /// anything that went wrong before or during the handshake.
@@ -241,6 +290,8 @@ async fn register_and_serve(
     node_id: &str,
     tools: &[String],
     token: &str,
+    user: &str,
+    pwd: &str,
 ) -> Result<()> {
     let stream = TcpStream::connect(dispatcher).await?;
     if let Err(e) = enable_tcp_keepalive(&stream) {
@@ -249,13 +300,7 @@ async fn register_and_serve(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let register_frame = json!({
-        "type": "register",
-        "version": 2,
-        "node_id": node_id,
-        "tools": tools,
-        "token": token,
-    });
+    let register_frame = build_register_frame(node_id, tools, token, user, pwd);
     let mut line = serde_json::to_string(&register_frame)?;
     line.push('\n');
     write_half.write_all(line.as_bytes()).await?;
@@ -271,7 +316,7 @@ async fn register_and_serve(
     match response.get("type").and_then(Value::as_str) {
         Some("registered") => {
             eprintln!(
-                "mcp-shell-server: registered as '{node_id}' (tools: {}) with dispatcher {dispatcher}",
+                "mcp-shell-server: registered as '{node_id}' (user: {user}, tools: {}) with dispatcher {dispatcher}",
                 tools.join(", ")
             );
         }
@@ -737,4 +782,39 @@ where
         s.push_str("\n[output truncated at 8 MiB]");
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tools_accepts_known_names_and_trims_whitespace() {
+        let tools = parse_tools(Some(" bash_exec, bash_exec_async ")).unwrap();
+        assert_eq!(tools, vec!["bash_exec", "bash_exec_async"]);
+    }
+
+    #[test]
+    fn parse_tools_absent_or_empty_means_nothing_exposed() {
+        assert_eq!(parse_tools(None).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_tools(Some("")).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_tools_rejects_unknown_names() {
+        assert!(parse_tools(Some("bash_exec,not_a_real_tool")).is_err());
+    }
+
+    #[test]
+    fn register_frame_is_protocol_v3_with_user_and_pwd() {
+        let tools = vec!["bash_exec".to_string()];
+        let frame = build_register_frame("gpu-node", &tools, "tok", "alice", "hunter2");
+        assert_eq!(frame["type"], "register");
+        assert_eq!(frame["version"], 3);
+        assert_eq!(frame["node_id"], "gpu-node");
+        assert_eq!(frame["tools"], json!(["bash_exec"]));
+        assert_eq!(frame["token"], "tok");
+        assert_eq!(frame["user"], "alice");
+        assert_eq!(frame["pwd"], "hunter2");
+    }
 }
