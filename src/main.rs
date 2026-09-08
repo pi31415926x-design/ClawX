@@ -566,11 +566,54 @@ fn error_response(id: Value, code: i64, message: impl Into<String>) -> JsonRpcRe
     }
 }
 
+/// Builds the child-process command for running a shell one-liner,
+/// platform-appropriate: `setsid bash -c <command>` on Unix (so we get a
+/// process group we can signal as a whole on timeout, see
+/// `kill_process_group_on_timeout` below), `powershell -Command <command>`
+/// on Windows (no setsid/bash there; PowerShell is the closest thing to a
+/// universally-present shell on a stock Windows box).
+fn shell_command(command: &str) -> Command {
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("setsid");
+        cmd.arg("bash").arg("-c").arg(command);
+        cmd
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("powershell");
+        cmd.arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(command);
+        cmd
+    }
+}
+
+/// Best-effort escalation when a command times out: on Unix, `setsid`
+/// gave the child its own process group, so send TERM to the whole group
+/// (covers subprocesses the command itself spawned, not just the direct
+/// child) before the harder `child.kill()`. On Windows there's no such
+/// group and no `pkill`, so this is a no-op there -- `child.kill()` alone
+/// has to do.
+async fn kill_process_group_on_timeout(pid: u32) {
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("pkill")
+            .arg("-TERM")
+            .arg("-s")
+            .arg(pid.to_string())
+            .output()
+            .await;
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+    }
+}
+
 async fn execute_command(command: &str) -> std::result::Result<(i32, String, String), String> {
-    let mut child = Command::new("setsid")
-        .arg("bash")
-        .arg("-c")
-        .arg(command)
+    let mut child = shell_command(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -592,12 +635,7 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
         Ok(Err(e)) => return Err(format!("Execution failed: {e}")),
         Err(_) => {
             if let Some(pid) = child.id() {
-                let _ = Command::new("pkill")
-                    .arg("-TERM")
-                    .arg("-s")
-                    .arg(pid.to_string())
-                    .output()
-                    .await;
+                kill_process_group_on_timeout(pid).await;
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -690,10 +728,7 @@ async fn handle_tool_call(
         return error_response(id, -32602, "Unknown tool");
     }
 
-    let mut child = match Command::new("setsid")
-        .arg("bash")
-        .arg("-c")
-        .arg(&command)
+    let mut child = match shell_command(&command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -714,12 +749,7 @@ async fn handle_tool_call(
         Ok(Err(e)) => return error_response(id, -32000, format!("Execution failed: {e}")),
         Err(_) => {
             if let Some(pid) = child.id() {
-                let _ = Command::new("pkill")
-                    .arg("-TERM")
-                    .arg("-s")
-                    .arg(pid.to_string())
-                    .output()
-                    .await;
+                kill_process_group_on_timeout(pid).await;
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
