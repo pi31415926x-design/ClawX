@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,6 +32,168 @@ const MAX_JOBS: usize = 64;
 /// it declares which of these the node is willing to expose, it can never
 /// grant a tool that doesn't exist.
 const KNOWN_TOOLS: &[&str] = &["bash_exec", "bash_exec_async", "bash_job_status"];
+
+/// Set once at startup from --verbose, read from wherever a task is about
+/// to be dispatched. A plain global instead of threading a bool through
+/// every function (parse args -> run_stdio/run_registered -> serve ->
+/// dispatch) because it's a cross-cutting concern -- "print what you're
+/// about to do" -- not part of any of those functions' actual job.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+const COLOR_RESET: &str = "\x1b[0m";
+const COLOR_CYAN: &str = "\x1b[36m";
+const COLOR_YELLOW: &str = "\x1b[33m";
+const COLOR_GREEN: &str = "\x1b[32m";
+
+/// stdout/stderr on a stock Windows console (conhost, not Windows
+/// Terminal) don't interpret ANSI escapes unless a process explicitly
+/// opts in via ENABLE_VIRTUAL_TERMINAL_PROCESSING. Unix terminals need no
+/// such thing. This is the one Windows-only startup step; everywhere else
+/// colored output is just an eprintln! with escape codes, same on both
+/// platforms.
+#[cfg(windows)]
+mod win_console {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: i32) -> *mut c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut c_void, dwMode: u32) -> i32;
+    }
+
+    const STD_OUTPUT_HANDLE: i32 = -11;
+    const STD_ERROR_HANDLE: i32 = -12;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
+
+    /// Best-effort: if there's no real console attached (piped, or a
+    /// service host) the mode calls just fail and we silently move on --
+    /// colored output degrades to raw escape codes in the output, same as
+    /// it would on a dumb terminal on Unix.
+    pub fn enable_ansi_colors() {
+        for handle_id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe {
+                let handle = GetStdHandle(handle_id);
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                let mut mode: u32 = 0;
+                if GetConsoleMode(handle, &mut mode) == 0 {
+                    continue;
+                }
+                let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+}
+
+/// Prints a received JSON-RPC task to stderr, in color, when --verbose is
+/// set. Called from `serve()` so it covers both transports (stdio and
+/// registered/TCP) from a single call site.
+fn log_task_verbose(id: &Value, method: &str, params: &Option<Value>) {
+    if !VERBOSE.load(Ordering::Relaxed) {
+        return;
+    }
+    let params_str = params
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    eprintln!(
+        "{CYAN}[verbose]{RESET} task received  {GREEN}method{RESET}={YELLOW}{method}{RESET}  id={id}  params={params_str}",
+        CYAN = COLOR_CYAN,
+        GREEN = COLOR_GREEN,
+        YELLOW = COLOR_YELLOW,
+        RESET = COLOR_RESET,
+    );
+}
+
+/// Prints --help and the full option/example reference, then the caller
+/// exits. Kept as plain text (no clap/structopt dependency) to match the
+/// rest of this file's hand-rolled arg parsing.
+fn print_help() {
+    println!(
+        r#"mcp-shell-server {version} -- runs shell commands on behalf of an MCP client
+
+USAGE:
+    mcp-shell-server [OPTIONS]
+
+Two mutually exclusive modes, chosen by whether --node-id/--dispatcher
+are given:
+
+  stdio mode (default, no flags required):
+    Reads JSON-RPC requests from stdin, writes responses to stdout. This
+    is how a local mcp-proxy spawns this binary as a child process.
+
+  registration mode (--node-id and --dispatcher together):
+    Dials out to a dispatcher (mcp-proxy) over TCP, registers as a named
+    node, and serves requests over that connection instead of stdio.
+    Reconnects with backoff on a dropped connection, but gives up after
+    5 consecutive failed connection attempts rather than retrying forever.
+
+OPTIONS:
+    -h, --help
+            Print this help and exit.
+
+    --node-id <ID>
+            This node's identifier, as it will appear to dispatcher
+            clients (registration mode). Required together with
+            --dispatcher.
+            Example: --node-id gpu-worker-01
+
+    --dispatcher <HOST:PORT>
+            Address of the mcp-proxy dispatcher to register with
+            (registration mode). Required together with --node-id.
+            Example: --dispatcher seoul.ddns.edux.dev:8383
+
+    --token <TOKEN>
+            Registration auth token. Can be given here or via the
+            MCP_SHELL_TOKEN environment variable instead (useful so the
+            token doesn't show up in `ps`). Required in registration mode.
+            Example: --token hi.com9981
+            Example: MCP_SHELL_TOKEN=hi.com9981 mcp-shell-server --node-id gpu-worker-01 --dispatcher seoul.ddns.edux.dev:8383
+
+    --user <USER>
+            The person this node belongs to (protocol v3). Can be given
+            here or via MCP_SHELL_USER instead. Required in registration
+            mode.
+            Example: --user haogle
+
+    --pwd <PWD>
+            Password identifying --user (protocol v3). Can be given here
+            or via MCP_SHELL_PWD instead. Required in registration mode.
+            Example: --pwd abc.com998
+
+    --tools <NAME,NAME,...>
+            Comma-separated subset of the tools this node exposes.
+            Unknown names are rejected at startup rather than accepted
+            and failing later. Omit or pass "" to register online but
+            expose nothing.
+            Known tools: {known_tools}
+            Example: --tools bash_exec,bash_exec_async,bash_job_status
+
+    --verbose
+            Print every received task (method, id, params) to stderr in
+            color as it comes in. Works in both stdio and registration
+            mode, and on both Linux and Windows consoles.
+            Example: mcp-shell-server --verbose
+
+EXAMPLES:
+    # Local stdio mode, spawned by mcp-proxy:
+    mcp-shell-server
+
+    # Register with a dispatcher, exposing all tools, verbose logging:
+    mcp-shell-server --node-id gpu-worker-01 \
+        --dispatcher seoul.ddns.edux.dev:8383 \
+        --user haogle --pwd abc.com998 --token hi.com9981 \
+        --tools bash_exec,bash_exec_async,bash_job_status \
+        --verbose
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+        known_tools = KNOWN_TOOLS.join(", "),
+    );
+}
+
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -114,12 +276,25 @@ struct JsonRpcResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // Checked before anything else, and outside the normal option loop
+    // below, so `--help` works no matter what else is (or isn't) on the
+    // command line, including a half-finished/invalid invocation.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    win_console::enable_ansi_colors();
+
     let mut node_id: Option<String> = None;
     let mut dispatcher: Option<String> = None;
     let mut token: Option<String> = None;
     let mut tools_arg: Option<String> = None;
     let mut user: Option<String> = None;
     let mut pwd: Option<String> = None;
+    let mut verbose = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -135,6 +310,9 @@ async fn main() -> Result<()> {
             "--token" => {
                 i += 1;
                 token = args.get(i).cloned();
+            }
+            "--verbose" => {
+                verbose = true;
             }
             "--tools" => {
                 i += 1;
@@ -154,6 +332,8 @@ async fn main() -> Result<()> {
         }
         i += 1;
     }
+
+    VERBOSE.store(verbose, Ordering::Relaxed);
 
     match (node_id, dispatcher) {
         (Some(node_id), Some(dispatcher)) => {
@@ -247,15 +427,35 @@ async fn run_registered(
     pwd: &str,
 ) -> Result<()> {
     const BACKOFF_STEPS_SECS: [u64; 4] = [1, 2, 5, 10];
+    // A misconfigured --dispatcher (typo'd host, firewalled port, wrong
+    // token) should fail loudly and let the process exit -- not spin
+    // forever with backoff, quietly burning a restart-loop slot in
+    // whatever supervises this process. A connection that *did* succeed
+    // and later dropped is a different, normal situation (network blip,
+    // dispatcher restart) and keeps the original unlimited-retry
+    // behavior; only *consecutive* failures without ever reaching a
+    // working connection count against this limit.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 5;
     let mut backoff_idx = 0usize;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         match register_and_serve(dispatcher, node_id, tools, token, user, pwd).await {
             Ok(()) => {
                 eprintln!("mcp-shell-server: dispatcher connection closed, reconnecting");
+                consecutive_failures = 0;
+                backoff_idx = 0;
             }
             Err(e) => {
-                eprintln!("mcp-shell-server: registration failed: {e}");
+                consecutive_failures += 1;
+                eprintln!(
+                    "mcp-shell-server: registration failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
+                );
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    return Err(anyhow::anyhow!(
+                        "giving up after {MAX_CONSECUTIVE_FAILURES} consecutive failed attempts to connect to dispatcher {dispatcher}"
+                    ));
+                }
             }
         }
 
@@ -428,6 +628,7 @@ where
         let JsonRpcRequest {
             id, method, params, ..
         } = req;
+        log_task_verbose(id.as_ref().unwrap_or(&Value::Null), &method, &params);
         let Some(req_id) = id else { continue };
 
         let tx = tx.clone();
