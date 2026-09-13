@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,10 +13,21 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 
+// --- Runtime-configurable execution limits ---
+//
+// All three below are set once during arg parsing in `main` (defaults if
+// the corresponding flag is absent) and read via the accessor functions
+// that follow them -- same "static + load wherever needed" pattern as
+// `VERBOSE` further down, and for the same reason: they're read from deep
+// inside async tasks (`serve`, `execute_command`, `JobStore::create`)
+// that have no natural path to receive a config struct without threading
+// it through every call site. None of them can change after startup.
+
 /// Commands get killed (see `kill_on_drop` below) and turned into a timeout
 /// error if they run longer than this, so a single hung `bash_exec` call
-/// can't pin a task (and its process) forever.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// can't pin a task (and its process) forever. Default 120s; override with
+/// `--command-timeout <SECS>`.
+static COMMAND_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(120);
 
 /// Grace period between sending TERM to a timed-out command's process
 /// group and escalating to a hard SIGKILL. Without this, TERM was being
@@ -27,11 +38,46 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 /// Upper bound on requests being handled at once. This is a safety valve,
 /// not a real limit on throughput: it just stops an unbounded burst of
 /// requests from spawning unboundedly many tasks/child processes before
-/// any of them finish.
-const MAX_IN_FLIGHT: usize = 16;
+/// any of them finish. 0 is a startup-only sentinel meaning "use
+/// `default_max_in_flight()`'s heuristic"; `main` always replaces it with
+/// a real value before `serve` ever reads it. Override with
+/// `--max-in-flight <N>`.
+static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RESPONSE_QUEUE_SIZE: usize = 128;
-const MAX_JOBS: usize = 64;
+
+/// Upper bound on concurrently tracked `bash_exec_async` jobs (running or
+/// completed-but-not-yet-polled via `bash_job_status`). Default 64;
+/// override with `--max-jobs <N>`.
+static MAX_JOBS: AtomicUsize = AtomicUsize::new(64);
+
+fn command_timeout() -> Duration {
+    Duration::from_secs(COMMAND_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
+
+fn max_in_flight() -> usize {
+    MAX_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+fn max_jobs() -> usize {
+    MAX_JOBS.load(Ordering::Relaxed)
+}
+
+/// Heuristic default for `MAX_IN_FLIGHT` when `--max-in-flight` isn't
+/// given: scale with the machine's core count instead of a single flat
+/// number that's either too small for a big box or too large for a small
+/// one. This is not a measured optimum -- `bash_exec`'s real bottleneck
+/// is usually how many child processes / how much IO the *target*
+/// machine can absorb, which correlates only loosely with core count --
+/// just a better guess than a constant. Override with `--max-in-flight`
+/// if it's wrong for your machine.
+fn default_max_in_flight() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores * 4).clamp(8, 64)
+}
 
 /// The full set of tool names this binary can ever implement. A node's
 /// --tools flag (registration mode only) must be a subset of this list --
@@ -178,6 +224,24 @@ OPTIONS:
             Known tools: {known_tools}
             Example: --tools bash_exec,bash_exec_async,bash_job_status
 
+    --command-timeout <SECS>
+            How long a single command may run before it's killed and the
+            call fails with a timeout error. Default: 120.
+            Example: --command-timeout 300
+
+    --max-in-flight <N>
+            Max number of requests handled at once (a safety valve, not a
+            throughput target -- see the comment on MAX_IN_FLIGHT in
+            main.rs). Default: a heuristic scaled off this machine's core
+            count (available_parallelism() * 4, clamped to 8..=64), not a
+            measured optimum -- override it if it doesn't fit your box.
+            Example: --max-in-flight 32
+
+    --max-jobs <N>
+            Max number of concurrently tracked bash_exec_async jobs
+            (running or completed-but-not-yet-polled). Default: 64.
+            Example: --max-jobs 128
+
     --verbose
             Print every received task (method, id, params) to stderr in
             color as it comes in. Works in both stdio and registration
@@ -194,6 +258,9 @@ EXAMPLES:
         --user haogle --pwd abc.com998 --token hi.com9981 \
         --tools bash_exec,bash_exec_async,bash_job_status \
         --verbose
+
+    # Stdio mode on a small box: lower concurrency, allow longer commands:
+    mcp-shell-server --max-in-flight 8 --command-timeout 600
 "#,
         version = env!("CARGO_PKG_VERSION"),
         known_tools = KNOWN_TOOLS.join(", "),
@@ -234,7 +301,7 @@ impl JobStore {
 
     fn create(&self) -> Option<(String, JobStatus)> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        if jobs.len() >= MAX_JOBS {
+        if jobs.len() >= max_jobs() {
             return None;
         }
         let id = format!("job-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -301,6 +368,9 @@ async fn main() -> Result<()> {
     let mut user: Option<String> = None;
     let mut pwd: Option<String> = None;
     let mut verbose = false;
+    let mut command_timeout_arg: Option<String> = None;
+    let mut max_in_flight_arg: Option<String> = None;
+    let mut max_jobs_arg: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -332,6 +402,18 @@ async fn main() -> Result<()> {
                 i += 1;
                 pwd = args.get(i).cloned();
             }
+            "--command-timeout" => {
+                i += 1;
+                command_timeout_arg = args.get(i).cloned();
+            }
+            "--max-in-flight" => {
+                i += 1;
+                max_in_flight_arg = args.get(i).cloned();
+            }
+            "--max-jobs" => {
+                i += 1;
+                max_jobs_arg = args.get(i).cloned();
+            }
             other => {
                 eprintln!("mcp-shell-server: ignoring unknown argument '{other}'");
             }
@@ -340,6 +422,19 @@ async fn main() -> Result<()> {
     }
 
     VERBOSE.store(verbose, Ordering::Relaxed);
+
+    let command_timeout_secs = parse_positive(command_timeout_arg.as_deref(), "--command-timeout", 120)?;
+    COMMAND_TIMEOUT_SECS.store(command_timeout_secs, Ordering::Relaxed);
+
+    let max_in_flight_val = parse_positive(
+        max_in_flight_arg.as_deref(),
+        "--max-in-flight",
+        default_max_in_flight() as u64,
+    )? as usize;
+    MAX_IN_FLIGHT.store(max_in_flight_val, Ordering::Relaxed);
+
+    let max_jobs_val = parse_positive(max_jobs_arg.as_deref(), "--max-jobs", 64)? as usize;
+    MAX_JOBS.store(max_jobs_val, Ordering::Relaxed);
 
     match (node_id, dispatcher) {
         (Some(node_id), Some(dispatcher)) => {
@@ -377,6 +472,26 @@ async fn main() -> Result<()> {
         (None, None) => run_stdio().await,
         _ => Err(anyhow::anyhow!(
             "--node-id and --dispatcher must be given together to enable registration mode"
+        )),
+    }
+}
+
+/// Parses an optional numeric CLI argument as a positive (non-zero) u64,
+/// falling back to `default` if the flag wasn't given at all. Used for
+/// --command-timeout/--max-in-flight/--max-jobs so a bad value (missing
+/// number, non-numeric, zero) fails fast at startup with a clear message
+/// instead of silently producing something nonsensical later -- e.g. a 0s
+/// timeout would kill every command instantly, and a 0-permit semaphore
+/// would make `serve` hang forever waiting for a permit that never comes.
+fn parse_positive(raw: Option<&str>, flag: &str, default: u64) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.parse::<u64>() {
+        Ok(0) => Err(anyhow::anyhow!("{flag} must be greater than 0, got 0")),
+        Ok(n) => Ok(n),
+        Err(_) => Err(anyhow::anyhow!(
+            "{flag} must be a positive integer, got '{raw}'"
         )),
     }
 }
@@ -565,7 +680,7 @@ fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
 
 /// Core JSON-RPC loop shared by both transports: reads newline-delimited
 /// requests from `reader`, dispatches each onto its own task (bounded by
-/// `MAX_IN_FLIGHT`), and writes newline-delimited responses to `writer`
+/// `max_in_flight()`), and writes newline-delimited responses to `writer`
 /// via a single dedicated writer task so concurrent handlers can never
 /// interleave their writes on the wire.
 async fn serve<R, W>(reader: R, writer: W) -> Result<()>
@@ -608,7 +723,7 @@ where
     // silently vanishing or, worse, taking down the whole process -- the
     // Rust analogue of letting a child task's exception escape an
     // unattended TaskGroup/ExceptionGroup.
-    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+    let semaphore = Arc::new(Semaphore::new(max_in_flight()));
     let jobs = Arc::new(JobStore::new());
     let mut in_flight: JoinSet<()> = JoinSet::new();
 
@@ -850,7 +965,7 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
         .ok_or_else(|| "stderr was not piped".to_string())?;
     let stdout_task = tokio::spawn(read_limited(stdout, MAX_OUTPUT_BYTES));
     let stderr_task = tokio::spawn(read_limited(stderr, MAX_OUTPUT_BYTES));
-    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+    let status = match tokio::time::timeout(command_timeout(), child.wait()).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("Execution failed: {e}")),
         Err(_) => {
@@ -865,7 +980,7 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
             stderr_task.abort();
             return Err(format!(
                 "Execution timed out after {}s",
-                COMMAND_TIMEOUT.as_secs()
+                command_timeout().as_secs()
             ));
         }
     };
