@@ -18,6 +18,12 @@ use tokio::task::{JoinError, JoinSet};
 /// can't pin a task (and its process) forever.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Grace period between sending TERM to a timed-out command's process
+/// group and escalating to a hard SIGKILL. Without this, TERM was being
+/// followed immediately by SIGKILL, giving the command no chance to
+/// actually catch the signal and clean up -- making TERM pointless.
+const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+
 /// Upper bound on requests being handled at once. This is a safety valve,
 /// not a real limit on throughput: it just stops an unbounded burst of
 /// requests from spawning unboundedly many tasks/child processes before
@@ -813,6 +819,19 @@ async fn kill_process_group_on_timeout(pid: u32) {
     }
 }
 
+/// What actually happens when a command times out: send TERM to the whole
+/// process group and give it `grace` to exit on its own, only escalating
+/// to SIGKILL if it's still alive afterwards. Shared by both `bash_exec`
+/// and `bash_exec_async` (via `execute_command`) so there's exactly one
+/// place that encodes "how do we kill a timed-out command".
+async fn terminate_child(child: &mut tokio::process::Child, pid: u32, grace: Duration) {
+    kill_process_group_on_timeout(pid).await;
+    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
+
 async fn execute_command(command: &str) -> std::result::Result<(i32, String, String), String> {
     let mut child = shell_command(command)
         .stdin(Stdio::null())
@@ -835,11 +854,13 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("Execution failed: {e}")),
         Err(_) => {
-            if let Some(pid) = child.id() {
-                kill_process_group_on_timeout(pid).await;
+            match child.id() {
+                Some(pid) => terminate_child(&mut child, pid, TERMINATE_GRACE).await,
+                None => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
             return Err(format!(
@@ -929,55 +950,15 @@ async fn handle_tool_call(
         return error_response(id, -32602, "Unknown tool");
     }
 
-    let mut child = match shell_command(&command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return error_response(id, -32000, format!("Execution failed: {e}")),
-    };
-
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_task = tokio::spawn(read_limited(stdout, MAX_OUTPUT_BYTES));
-    let stderr_task = tokio::spawn(read_limited(stderr, MAX_OUTPUT_BYTES));
-
-    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return error_response(id, -32000, format!("Execution failed: {e}")),
-        Err(_) => {
-            if let Some(pid) = child.id() {
-                kill_process_group_on_timeout(pid).await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
-            return error_response(
-                id,
-                -32000,
-                format!("Execution timed out after {}s", COMMAND_TIMEOUT.as_secs()),
-            );
-        }
-    };
-
-    let stdout_data = match stdout_task.await {
-        Ok(Ok(v)) => v,
-        _ => String::new(),
-    };
-    let stderr_data = match stderr_task.await {
-        Ok(Ok(v)) => v,
-        _ => String::new(),
+    // Same execution path as bash_exec_async (spawn, read, timeout, kill);
+    // this just waits for it inline instead of handing back a job_id.
+    let (exit_code, stdout_data, stderr_data) = match execute_command(&command).await {
+        Ok(v) => v,
+        Err(message) => return error_response(id, -32000, message),
     };
 
     let combined = format!(
-        "Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-        status.code().unwrap_or(-1),
-        stdout_data,
-        stderr_data
+        "Exit Code: {exit_code}\nSTDOUT:\n{stdout_data}\nSTDERR:\n{stderr_data}"
     );
     // Avoid duplicating potentially large stdout/stderr in structuredContent.
     JsonRpcResponse {
@@ -985,7 +966,7 @@ async fn handle_tool_call(
         id: Some(id),
         result: Some(json!({
             "content": [{"type": "text", "text": combined}],
-            "isError": !status.success()
+            "isError": exit_code != 0
         })),
         error: None,
     }
