@@ -273,7 +273,6 @@ EXAMPLES:
     );
 }
 
-
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -429,7 +428,8 @@ async fn main() -> Result<()> {
 
     VERBOSE.store(verbose, Ordering::Relaxed);
 
-    let command_timeout_secs = parse_positive(command_timeout_arg.as_deref(), "--command-timeout", 120)?;
+    let command_timeout_secs =
+        parse_positive(command_timeout_arg.as_deref(), "--command-timeout", 120)?;
     COMMAND_TIMEOUT_SECS.store(command_timeout_secs, Ordering::Relaxed);
 
     let max_in_flight_val = parse_positive(
@@ -595,7 +595,13 @@ async fn run_registered(
 /// Builds the registration frame (protocol v3, see docs/PROTOCOL.md).
 /// Pulled out of `register_and_serve` as a pure function so its shape can
 /// be unit tested without opening a real TCP connection.
-fn build_register_frame(node_id: &str, tools: &[String], token: &str, user: &str, pwd: &str) -> Value {
+fn build_register_frame(
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+    user: &str,
+    pwd: &str,
+) -> Value {
     json!({
         "type": "register",
         "version": 3,
@@ -1217,9 +1223,8 @@ async fn handle_tool_call(
         Err(message) => return error_response(id, -32000, message),
     };
 
-    let combined = format!(
-        "Exit Code: {exit_code}\nSTDOUT:\n{stdout_data}\nSTDERR:\n{stderr_data}"
-    );
+    let combined =
+        format!("Exit Code: {exit_code}\nSTDOUT:\n{stdout_data}\nSTDERR:\n{stderr_data}");
     // Avoid duplicating potentially large stdout/stderr in structuredContent.
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
