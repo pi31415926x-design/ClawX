@@ -83,7 +83,13 @@ fn default_max_in_flight() -> usize {
 /// --tools flag (registration mode only) must be a subset of this list --
 /// it declares which of these the node is willing to expose, it can never
 /// grant a tool that doesn't exist.
-const KNOWN_TOOLS: &[&str] = &["bash_exec", "bash_exec_async", "bash_job_status"];
+const KNOWN_TOOLS: &[&str] = &[
+    "bash_exec",
+    "bash_exec_async",
+    "bash_job_status",
+    "twenty_mcp_list_tools",
+    "twenty_mcp_call",
+];
 
 /// Set once at startup from --verbose, read from wherever a task is about
 /// to be dispatched. A plain global instead of threading a bool through
@@ -165,10 +171,10 @@ fn log_task_verbose(id: &Value, method: &str, params: &Option<Value>) {
 /// rest of this file's hand-rolled arg parsing.
 fn print_help() {
     println!(
-        r#"mcp-shell-server {version} -- runs shell commands on behalf of an MCP client
+        r#"clawx-service {version} -- runs shell commands on behalf of an MCP client
 
 USAGE:
-    mcp-shell-server [OPTIONS]
+    clawx-service [OPTIONS]
 
 Two mutually exclusive modes, chosen by whether --node-id/--dispatcher
 are given:
@@ -203,7 +209,7 @@ OPTIONS:
             MCP_SHELL_TOKEN environment variable instead (useful so the
             token doesn't show up in `ps`). Required in registration mode.
             Example: --token hi.com9981
-            Example: MCP_SHELL_TOKEN=hi.com9981 mcp-shell-server --node-id gpu-worker-01 --dispatcher seoul.ddns.edux.dev:8383
+            Example: MCP_SHELL_TOKEN=hi.com9981 clawx-service --node-id gpu-worker-01 --dispatcher seoul.ddns.edux.dev:8383
 
     --user <USER>
             The person this node belongs to (protocol v3). Can be given
@@ -246,21 +252,21 @@ OPTIONS:
             Print every received task (method, id, params) to stderr in
             color as it comes in. Works in both stdio and registration
             mode, and on both Linux and Windows consoles.
-            Example: mcp-shell-server --verbose
+            Example: clawx-service --verbose
 
 EXAMPLES:
     # Local stdio mode, spawned by mcp-proxy:
-    mcp-shell-server
+    clawx-service
 
     # Register with a dispatcher, exposing all tools, verbose logging:
-    mcp-shell-server --node-id gpu-worker-01 \
+    clawx-service --node-id gpu-worker-01 \
         --dispatcher seoul.ddns.edux.dev:8383 \
         --user haogle --pwd abc.com998 --token hi.com9981 \
         --tools bash_exec,bash_exec_async,bash_job_status \
         --verbose
 
     # Stdio mode on a small box: lower concurrency, allow longer commands:
-    mcp-shell-server --max-in-flight 8 --command-timeout 600
+    clawx-service --max-in-flight 8 --command-timeout 600
 "#,
         version = env!("CARGO_PKG_VERSION"),
         known_tools = KNOWN_TOOLS.join(", "),
@@ -415,7 +421,7 @@ async fn main() -> Result<()> {
                 max_jobs_arg = args.get(i).cloned();
             }
             other => {
-                eprintln!("mcp-shell-server: ignoring unknown argument '{other}'");
+                eprintln!("clawx-service: ignoring unknown argument '{other}'");
             }
         }
         i += 1;
@@ -563,14 +569,14 @@ async fn run_registered(
     loop {
         match register_and_serve(dispatcher, node_id, tools, token, user, pwd).await {
             Ok(()) => {
-                eprintln!("mcp-shell-server: dispatcher connection closed, reconnecting");
+                eprintln!("clawx-service: dispatcher connection closed, reconnecting");
                 consecutive_failures = 0;
                 backoff_idx = 0;
             }
             Err(e) => {
                 consecutive_failures += 1;
                 eprintln!(
-                    "mcp-shell-server: registration failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
+                    "clawx-service: registration failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
                 );
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                     return Err(anyhow::anyhow!(
@@ -616,7 +622,7 @@ async fn register_and_serve(
 ) -> Result<()> {
     let stream = TcpStream::connect(dispatcher).await?;
     if let Err(e) = enable_tcp_keepalive(&stream) {
-        eprintln!("mcp-shell-server: failed to enable TCP keepalive: {e}");
+        eprintln!("clawx-service: failed to enable TCP keepalive: {e}");
     }
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -637,7 +643,7 @@ async fn register_and_serve(
     match response.get("type").and_then(Value::as_str) {
         Some("registered") => {
             eprintln!(
-                "mcp-shell-server: registered as '{node_id}' (user: {user}, tools: {}) with dispatcher {dispatcher}",
+                "clawx-service: registered as '{node_id}' (user: {user}, tools: {}) with dispatcher {dispatcher}",
                 tools.join(", ")
             );
         }
@@ -701,11 +707,11 @@ where
         while let Some(mut out) = rx.recv().await {
             out.push('\n');
             if let Err(e) = writer.write_all(out.as_bytes()).await {
-                eprintln!("mcp-shell-server: failed to write response: {e}");
+                eprintln!("clawx-service: failed to write response: {e}");
                 break;
             }
             if let Err(e) = writer.flush().await {
-                eprintln!("mcp-shell-server: failed to flush output: {e}");
+                eprintln!("clawx-service: failed to flush output: {e}");
                 break;
             }
         }
@@ -766,7 +772,7 @@ where
                 Ok(out) => {
                     let _ = tx.send(out).await;
                 }
-                Err(e) => eprintln!("mcp-shell-server: failed to serialize response: {e}"),
+                Err(e) => eprintln!("clawx-service: failed to serialize response: {e}"),
             }
         });
 
@@ -790,9 +796,9 @@ where
 fn log_join_result(res: std::result::Result<(), JoinError>) {
     if let Err(e) = res {
         if e.is_panic() {
-            eprintln!("mcp-shell-server: a request handler panicked: {e}");
+            eprintln!("clawx-service: a request handler panicked: {e}");
         } else {
-            eprintln!("mcp-shell-server: a request handler was cancelled: {e}");
+            eprintln!("clawx-service: a request handler was cancelled: {e}");
         }
     }
 }
@@ -864,6 +870,16 @@ async fn dispatch(
                             "properties": {"job_id": {"type": "string"}},
                             "required": ["job_id"]
                         }
+                    },
+                    {
+                        "name": "twenty_mcp_list_tools",
+                        "description": "List the native MCP tools available from the connected Twenty CRM instance",
+                        "inputSchema": {"type":"object","properties":{},"required":[]}
+                    },
+                    {
+                        "name": "twenty_mcp_call",
+                        "description": "Execute a native Twenty CRM MCP tool",
+                        "inputSchema": {"type":"object","properties":{"tool_name":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_name"]}
                     }
                 ]
             })),
@@ -995,6 +1011,102 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
     Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
+#[derive(Clone)]
+struct TwentyMcpConfig {
+    url: String,
+    token: String,
+}
+
+impl TwentyMcpConfig {
+    fn from_env() -> Option<Self> {
+        let token = std::env::var("TWENTY_MCP_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let url = std::env::var("TWENTY_MCP_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3100/mcp".to_string());
+        Some(Self { url, token })
+    }
+}
+
+async fn twenty_mcp_request(
+    cfg: &TwentyMcpConfig,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let init_id = 1;
+    let init = json!({
+        "jsonrpc":"2.0", "id":init_id, "method":"initialize",
+        "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"clawx-service","version":env!("CARGO_PKG_VERSION")}}
+    });
+    let resp = client
+        .post(&cfg.url)
+        .bearer_auth(&cfg.token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&init)
+        .send()
+        .await
+        .map_err(|e| format!("Twenty MCP initialize failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Twenty MCP initialize HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let session = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let _init_value = parse_mcp_body(resp.text().await.map_err(|e| e.to_string())?)?;
+
+    let req = json!({"jsonrpc":"2.0","id":2,"method":method,"params":params});
+    let mut r = client
+        .post(&cfg.url)
+        .bearer_auth(&cfg.token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&req);
+    if let Some(s) = session {
+        r = r.header("Mcp-Session-Id", s);
+    }
+    let resp = r
+        .send()
+        .await
+        .map_err(|e| format!("Twenty MCP request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Twenty MCP HTTP {status}: {body}"));
+    }
+    parse_mcp_body(body)
+}
+
+fn parse_mcp_body(body: String) -> Result<Value, String> {
+    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+        return Ok(v);
+    }
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
+            if let Ok(v) = serde_json::from_str::<Value>(data) {
+                return Ok(v);
+            }
+        }
+    }
+    Err(format!(
+        "Invalid MCP response: {}",
+        body.chars().take(1000).collect::<String>()
+    ))
+}
+
+fn twenty_result_text(v: Value) -> String {
+    if let Some(err) = v.get("error") {
+        return format!("Twenty MCP error: {}", err);
+    }
+    v.get("result").cloned().unwrap_or(v).to_string()
+}
+
 async fn handle_tool_call(
     id: Value,
     params: Option<Value>,
@@ -1003,6 +1115,39 @@ async fn handle_tool_call(
     let params = params.unwrap_or_default();
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_default();
+    if name == "twenty_mcp_list_tools" || name == "twenty_mcp_call" {
+        let Some(cfg) = TwentyMcpConfig::from_env() else {
+            return error_response(
+                id,
+                -32000,
+                "Twenty MCP is not configured: set TWENTY_MCP_TOKEN and optionally TWENTY_MCP_URL",
+            );
+        };
+        let (method, call_params) = if name == "twenty_mcp_list_tools" {
+            ("tools/list", json!({}))
+        } else {
+            let tool_name = match args.get("tool_name").and_then(|v| v.as_str()) {
+                Some(v) if !v.is_empty() => v,
+                _ => return error_response(id, -32602, "Missing tool_name argument"),
+            };
+            let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            (
+                "tools/call",
+                json!({"name":tool_name,"arguments":arguments}),
+            )
+        };
+        return match twenty_mcp_request(&cfg, method, call_params).await {
+            Ok(v) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id),
+                error: None,
+                result: Some(
+                    json!({"content":[{"type":"text","text":twenty_result_text(v)}],"isError":false}),
+                ),
+            },
+            Err(e) => error_response(id, -32000, e),
+        };
+    }
     if name == "bash_job_status" {
         let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
             Some(v) if !v.is_empty() => v,

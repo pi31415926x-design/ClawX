@@ -1,5 +1,5 @@
 [package]
-name = "mcp-shell-server"
+name = "clawx-service"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,4 +9,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 socket2 = { version = "0.5", features = ["all"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Cross-compile mcp-shell-server.exe for Windows via Docker.
-# Run from anywhere; output lands in <repo>/dist/mcp-shell-server.exe.
+# Cross-compile clawx-service.exe for Windows via Docker.
+# Run from anywhere; output lands in <repo>/dist/clawx-service.exe.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,4 +11,4 @@ docker buildx build \
   --output type=local,dest=./dist \
   .
 
-echo "Built: $repo_root/dist/mcp-shell-server.exe"
+echo "Built: $repo_root/dist/clawx-service.exe"
