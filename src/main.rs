@@ -1,29 +1,277 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::{JoinError, JoinSet};
 
+// --- Runtime-configurable execution limits ---
+//
+// All three below are set once during arg parsing in `main` (defaults if
+// the corresponding flag is absent) and read via the accessor functions
+// that follow them -- same "static + load wherever needed" pattern as
+// `VERBOSE` further down, and for the same reason: they're read from deep
+// inside async tasks (`serve`, `execute_command`, `JobStore::create`)
+// that have no natural path to receive a config struct without threading
+// it through every call site. None of them can change after startup.
+
 /// Commands get killed (see `kill_on_drop` below) and turned into a timeout
 /// error if they run longer than this, so a single hung `bash_exec` call
-/// can't pin a task (and its process) forever.
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// can't pin a task (and its process) forever. Default 120s; override with
+/// `--command-timeout <SECS>`.
+static COMMAND_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(120);
+
+/// Grace period between sending TERM to a timed-out command's process
+/// group and escalating to a hard SIGKILL. Without this, TERM was being
+/// followed immediately by SIGKILL, giving the command no chance to
+/// actually catch the signal and clean up -- making TERM pointless.
+const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 
 /// Upper bound on requests being handled at once. This is a safety valve,
 /// not a real limit on throughput: it just stops an unbounded burst of
 /// requests from spawning unboundedly many tasks/child processes before
-/// any of them finish.
-const MAX_IN_FLIGHT: usize = 16;
+/// any of them finish. 0 is a startup-only sentinel meaning "use
+/// `default_max_in_flight()`'s heuristic"; `main` always replaces it with
+/// a real value before `serve` ever reads it. Override with
+/// `--max-in-flight <N>`.
+static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const RESPONSE_QUEUE_SIZE: usize = 128;
-const MAX_JOBS: usize = 64;
+
+/// Upper bound on concurrently tracked `bash_exec_async` jobs (running or
+/// completed-but-not-yet-polled via `bash_job_status`). Default 64;
+/// override with `--max-jobs <N>`.
+static MAX_JOBS: AtomicUsize = AtomicUsize::new(64);
+
+fn command_timeout() -> Duration {
+    Duration::from_secs(COMMAND_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
+
+fn max_in_flight() -> usize {
+    MAX_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+fn max_jobs() -> usize {
+    MAX_JOBS.load(Ordering::Relaxed)
+}
+
+/// Heuristic default for `MAX_IN_FLIGHT` when `--max-in-flight` isn't
+/// given: scale with the machine's core count instead of a single flat
+/// number that's either too small for a big box or too large for a small
+/// one. This is not a measured optimum -- `bash_exec`'s real bottleneck
+/// is usually how many child processes / how much IO the *target*
+/// machine can absorb, which correlates only loosely with core count --
+/// just a better guess than a constant. Override with `--max-in-flight`
+/// if it's wrong for your machine.
+fn default_max_in_flight() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores * 4).clamp(8, 64)
+}
+
+/// The full set of tool names this binary can ever implement. A node's
+/// --tools flag (registration mode only) must be a subset of this list --
+/// it declares which of these the node is willing to expose, it can never
+/// grant a tool that doesn't exist.
+const KNOWN_TOOLS: &[&str] = &[
+    "bash_exec",
+    "bash_exec_async",
+    "bash_job_status",
+    "twenty_mcp_list_tools",
+    "twenty_mcp_call",
+];
+
+/// Set once at startup from --verbose, read from wherever a task is about
+/// to be dispatched. A plain global instead of threading a bool through
+/// every function (parse args -> run_stdio/run_registered -> serve ->
+/// dispatch) because it's a cross-cutting concern -- "print what you're
+/// about to do" -- not part of any of those functions' actual job.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+const COLOR_RESET: &str = "\x1b[0m";
+const COLOR_CYAN: &str = "\x1b[36m";
+const COLOR_YELLOW: &str = "\x1b[33m";
+const COLOR_GREEN: &str = "\x1b[32m";
+
+/// stdout/stderr on a stock Windows console (conhost, not Windows
+/// Terminal) don't interpret ANSI escapes unless a process explicitly
+/// opts in via ENABLE_VIRTUAL_TERMINAL_PROCESSING. Unix terminals need no
+/// such thing. This is the one Windows-only startup step; everywhere else
+/// colored output is just an eprintln! with escape codes, same on both
+/// platforms.
+#[cfg(windows)]
+mod win_console {
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: i32) -> *mut c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut c_void, dwMode: u32) -> i32;
+    }
+
+    const STD_OUTPUT_HANDLE: i32 = -11;
+    const STD_ERROR_HANDLE: i32 = -12;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
+
+    /// Best-effort: if there's no real console attached (piped, or a
+    /// service host) the mode calls just fail and we silently move on --
+    /// colored output degrades to raw escape codes in the output, same as
+    /// it would on a dumb terminal on Unix.
+    pub fn enable_ansi_colors() {
+        for handle_id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe {
+                let handle = GetStdHandle(handle_id);
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                let mut mode: u32 = 0;
+                if GetConsoleMode(handle, &mut mode) == 0 {
+                    continue;
+                }
+                let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+}
+
+/// Prints a received JSON-RPC task to stderr, in color, when --verbose is
+/// set. Called from `serve()` so it covers both transports (stdio and
+/// registered/TCP) from a single call site.
+fn log_task_verbose(id: &Value, method: &str, params: &Option<Value>) {
+    if !VERBOSE.load(Ordering::Relaxed) {
+        return;
+    }
+    let params_str = params
+        .as_ref()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    eprintln!(
+        "{CYAN}[verbose]{RESET} task received  {GREEN}method{RESET}={YELLOW}{method}{RESET}  id={id}  params={params_str}",
+        CYAN = COLOR_CYAN,
+        GREEN = COLOR_GREEN,
+        YELLOW = COLOR_YELLOW,
+        RESET = COLOR_RESET,
+    );
+}
+
+/// Prints --help and the full option/example reference, then the caller
+/// exits. Kept as plain text (no clap/structopt dependency) to match the
+/// rest of this file's hand-rolled arg parsing.
+fn print_help() {
+    println!(
+        r#"clawx-service {version} -- runs shell commands on behalf of an MCP client
+
+USAGE:
+    clawx-service [OPTIONS]
+
+Two mutually exclusive modes, chosen by whether --node-id/--dispatcher
+are given:
+
+  stdio mode (default, no flags required):
+    Reads JSON-RPC requests from stdin, writes responses to stdout. This
+    is how a local mcp-proxy spawns this binary as a child process.
+
+  registration mode (--node-id and --dispatcher together):
+    Dials out to a dispatcher (mcp-proxy) over TCP, registers as a named
+    node, and serves requests over that connection instead of stdio.
+    Reconnects with backoff on a dropped connection, but gives up after
+    5 consecutive failed connection attempts rather than retrying forever.
+
+OPTIONS:
+    -h, --help
+            Print this help and exit.
+
+    --node-id <ID>
+            This node's identifier, as it will appear to dispatcher
+            clients (registration mode). Required together with
+            --dispatcher.
+            Example: --node-id gpu-worker-01
+
+    --dispatcher <HOST:PORT>
+            Address of the mcp-proxy dispatcher to register with
+            (registration mode). Required together with --node-id.
+            Example: --dispatcher seoul.ddns.edux.dev:8383
+
+    --token <TOKEN>
+            Registration auth token. Can be given here or via the
+            MCP_SHELL_TOKEN environment variable instead (useful so the
+            token doesn't show up in `ps`). Required in registration mode.
+            Example: --token hi.com9981
+            Example: MCP_SHELL_TOKEN=hi.com9981 clawx-service --node-id gpu-worker-01 --dispatcher seoul.ddns.edux.dev:8383
+
+    --user <USER>
+            The person this node belongs to (protocol v3). Can be given
+            here or via MCP_SHELL_USER instead. Required in registration
+            mode.
+            Example: --user haogle
+
+    --pwd <PWD>
+            Password identifying --user (protocol v3). Can be given here
+            or via MCP_SHELL_PWD instead. Required in registration mode.
+            Example: --pwd abc.com998
+
+    --tools <NAME,NAME,...>
+            Comma-separated subset of the tools this node exposes.
+            Unknown names are rejected at startup rather than accepted
+            and failing later. Omit or pass "" to register online but
+            expose nothing.
+            Known tools: {known_tools}
+            Example: --tools bash_exec,bash_exec_async,bash_job_status
+
+    --command-timeout <SECS>
+            How long a single command may run before it's killed and the
+            call fails with a timeout error. Default: 120.
+            Example: --command-timeout 300
+
+    --max-in-flight <N>
+            Max number of requests handled at once (a safety valve, not a
+            throughput target -- see the comment on MAX_IN_FLIGHT in
+            main.rs). Default: a heuristic scaled off this machine's core
+            count (available_parallelism() * 4, clamped to 8..=64), not a
+            measured optimum -- override it if it doesn't fit your box.
+            Example: --max-in-flight 32
+
+    --max-jobs <N>
+            Max number of concurrently tracked bash_exec_async jobs
+            (running or completed-but-not-yet-polled). Default: 64.
+            Example: --max-jobs 128
+
+    --verbose
+            Print every received task (method, id, params) to stderr in
+            color as it comes in. Works in both stdio and registration
+            mode, and on both Linux and Windows consoles.
+            Example: clawx-service --verbose
+
+EXAMPLES:
+    # Local stdio mode, spawned by mcp-proxy:
+    clawx-service
+
+    # Register with a dispatcher, exposing all tools, verbose logging:
+    clawx-service --node-id gpu-worker-01 \
+        --dispatcher seoul.ddns.edux.dev:8383 \
+        --user haogle --pwd abc.com998 --token hi.com9981 \
+        --tools bash_exec,bash_exec_async,bash_job_status \
+        --verbose
+
+    # Stdio mode on a small box: lower concurrency, allow longer commands:
+    clawx-service --max-in-flight 8 --command-timeout 600
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+        known_tools = KNOWN_TOOLS.join(", "),
+    );
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -58,7 +306,7 @@ impl JobStore {
 
     fn create(&self) -> Option<(String, JobStatus)> {
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        if jobs.len() >= MAX_JOBS {
+        if jobs.len() >= max_jobs() {
             return None;
         }
         let id = format!("job-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -105,23 +353,371 @@ struct JsonRpcResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut reader = BufReader::new(stdin()).lines();
+    let args: Vec<String> = std::env::args().collect();
 
-    // A single dedicated writer task owns stdout and is the only thing
-    // that ever writes to it. Requests are handled concurrently below, so
-    // without this, two tasks finishing at the same moment could interleave
-    // their writes and corrupt the JSON-RPC stream on the wire.
+    // Checked before anything else, and outside the normal option loop
+    // below, so `--help` works no matter what else is (or isn't) on the
+    // command line, including a half-finished/invalid invocation.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    win_console::enable_ansi_colors();
+
+    let mut node_id: Option<String> = None;
+    let mut dispatcher: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut tools_arg: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut pwd: Option<String> = None;
+    let mut verbose = false;
+    let mut command_timeout_arg: Option<String> = None;
+    let mut max_in_flight_arg: Option<String> = None;
+    let mut max_jobs_arg: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--node-id" => {
+                i += 1;
+                node_id = args.get(i).cloned();
+            }
+            "--dispatcher" => {
+                i += 1;
+                dispatcher = args.get(i).cloned();
+            }
+            "--token" => {
+                i += 1;
+                token = args.get(i).cloned();
+            }
+            "--verbose" => {
+                verbose = true;
+            }
+            "--tools" => {
+                i += 1;
+                tools_arg = args.get(i).cloned();
+            }
+            "--user" => {
+                i += 1;
+                user = args.get(i).cloned();
+            }
+            "--pwd" => {
+                i += 1;
+                pwd = args.get(i).cloned();
+            }
+            "--command-timeout" => {
+                i += 1;
+                command_timeout_arg = args.get(i).cloned();
+            }
+            "--max-in-flight" => {
+                i += 1;
+                max_in_flight_arg = args.get(i).cloned();
+            }
+            "--max-jobs" => {
+                i += 1;
+                max_jobs_arg = args.get(i).cloned();
+            }
+            other => {
+                eprintln!("clawx-service: ignoring unknown argument '{other}'");
+            }
+        }
+        i += 1;
+    }
+
+    VERBOSE.store(verbose, Ordering::Relaxed);
+
+    let command_timeout_secs =
+        parse_positive(command_timeout_arg.as_deref(), "--command-timeout", 120)?;
+    COMMAND_TIMEOUT_SECS.store(command_timeout_secs, Ordering::Relaxed);
+
+    let max_in_flight_val = parse_positive(
+        max_in_flight_arg.as_deref(),
+        "--max-in-flight",
+        default_max_in_flight() as u64,
+    )? as usize;
+    MAX_IN_FLIGHT.store(max_in_flight_val, Ordering::Relaxed);
+
+    let max_jobs_val = parse_positive(max_jobs_arg.as_deref(), "--max-jobs", 64)? as usize;
+    MAX_JOBS.store(max_jobs_val, Ordering::Relaxed);
+
+    match (node_id, dispatcher) {
+        (Some(node_id), Some(dispatcher)) => {
+            let token = token
+                .or_else(|| std::env::var("MCP_SHELL_TOKEN").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires a token: pass --token or set MCP_SHELL_TOKEN"
+                    )
+                })?;
+            // `user`/`pwd` identify which *person* this node belongs to
+            // (protocol v3, see docs/PROTOCOL.md) -- separate from
+            // `token`, which only answers "is this connection allowed to
+            // register at all". The dispatcher rejects registration
+            // outright (`missing_credentials`) if either is empty, so
+            // fail the same way locally rather than making a doomed round
+            // trip over the network first.
+            let user = user
+                .or_else(|| std::env::var("MCP_SHELL_USER").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires a user: pass --user or set MCP_SHELL_USER"
+                    )
+                })?;
+            let pwd = pwd
+                .or_else(|| std::env::var("MCP_SHELL_PWD").ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "registration mode requires a pwd: pass --pwd or set MCP_SHELL_PWD"
+                    )
+                })?;
+            let tools = parse_tools(tools_arg.as_deref())?;
+            run_registered(&dispatcher, &node_id, &tools, &token, &user, &pwd).await
+        }
+        (None, None) => run_stdio().await,
+        _ => Err(anyhow::anyhow!(
+            "--node-id and --dispatcher must be given together to enable registration mode"
+        )),
+    }
+}
+
+/// Parses an optional numeric CLI argument as a positive (non-zero) u64,
+/// falling back to `default` if the flag wasn't given at all. Used for
+/// --command-timeout/--max-in-flight/--max-jobs so a bad value (missing
+/// number, non-numeric, zero) fails fast at startup with a clear message
+/// instead of silently producing something nonsensical later -- e.g. a 0s
+/// timeout would kill every command instantly, and a 0-permit semaphore
+/// would make `serve` hang forever waiting for a permit that never comes.
+fn parse_positive(raw: Option<&str>, flag: &str, default: u64) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.parse::<u64>() {
+        Ok(0) => Err(anyhow::anyhow!("{flag} must be greater than 0, got 0")),
+        Ok(n) => Ok(n),
+        Err(_) => Err(anyhow::anyhow!(
+            "{flag} must be a positive integer, got '{raw}'"
+        )),
+    }
+}
+
+/// Parses a comma-separated --tools value into a validated list. Rejecting
+/// unknown names here (rather than letting the dispatcher discover it
+/// later) means a typo fails fast, locally, before ever touching the
+/// network -- the same "fail before you commit" instinct as validating a
+/// config file before starting a service. Absent flag or empty string
+/// means "expose nothing": the node registers and shows up as online, but
+/// isn't a valid target for any tool call.
+fn parse_tools(raw: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            if KNOWN_TOOLS.contains(&name) {
+                Ok(name.to_string())
+            } else {
+                Err(anyhow::anyhow!(
+                    "unknown tool '{name}' in --tools (known tools: {})",
+                    KNOWN_TOOLS.join(", ")
+                ))
+            }
+        })
+        .collect()
+}
+
+/// Local stdio mode: reads JSON-RPC requests from stdin, writes responses
+/// to stdout. This is the original transport, unchanged, and remains the
+/// default so a plain `mcp-proxy`-spawned child process keeps working
+/// exactly as before.
+async fn run_stdio() -> Result<()> {
+    let reader = BufReader::new(stdin());
+    let writer = stdout();
+    serve(reader, writer).await
+}
+
+/// Registration mode: dial out to `dispatcher`, identify as `node_id`
+/// owned by `user` and exposing `tools`, and once accepted, serve requests
+/// over that TCP
+/// connection instead of stdio. Reconnects with a capped backoff whenever
+/// the connection drops, so a dispatcher restart or a network blip
+/// doesn't require restarting this process by hand.
+async fn run_registered(
+    dispatcher: &str,
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+    user: &str,
+    pwd: &str,
+) -> Result<()> {
+    const BACKOFF_STEPS_SECS: [u64; 4] = [1, 2, 5, 10];
+    // A misconfigured --dispatcher (typo'd host, firewalled port, wrong
+    // token) should fail loudly and let the process exit -- not spin
+    // forever with backoff, quietly burning a restart-loop slot in
+    // whatever supervises this process. A connection that *did* succeed
+    // and later dropped is a different, normal situation (network blip,
+    // dispatcher restart) and keeps the original unlimited-retry
+    // behavior; only *consecutive* failures without ever reaching a
+    // working connection count against this limit.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+    let mut backoff_idx = 0usize;
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        match register_and_serve(dispatcher, node_id, tools, token, user, pwd).await {
+            Ok(()) => {
+                eprintln!("clawx-service: dispatcher connection closed, reconnecting");
+                consecutive_failures = 0;
+                backoff_idx = 0;
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                eprintln!(
+                    "clawx-service: registration failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {e}"
+                );
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    return Err(anyhow::anyhow!(
+                        "giving up after {MAX_CONSECUTIVE_FAILURES} consecutive failed attempts to connect to dispatcher {dispatcher}"
+                    ));
+                }
+            }
+        }
+
+        let delay = BACKOFF_STEPS_SECS[backoff_idx.min(BACKOFF_STEPS_SECS.len() - 1)];
+        backoff_idx += 1;
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+/// Builds the registration frame (protocol v3, see docs/PROTOCOL.md).
+/// Pulled out of `register_and_serve` as a pure function so its shape can
+/// be unit tested without opening a real TCP connection.
+fn build_register_frame(
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+    user: &str,
+    pwd: &str,
+) -> Value {
+    json!({
+        "type": "register",
+        "version": 3,
+        "node_id": node_id,
+        "tools": tools,
+        "token": token,
+        "user": user,
+        "pwd": pwd,
+    })
+}
+
+/// One connection attempt: connect, send the registration frame (protocol
+/// v3, see docs/PROTOCOL.md), wait for the dispatcher's response, and on
+/// success hand off to `serve`. Returns `Ok(())` if the connection was
+/// accepted and later closed cleanly by the peer (EOF), or `Err` for
+/// anything that went wrong before or during the handshake.
+async fn register_and_serve(
+    dispatcher: &str,
+    node_id: &str,
+    tools: &[String],
+    token: &str,
+    user: &str,
+    pwd: &str,
+) -> Result<()> {
+    let stream = TcpStream::connect(dispatcher).await?;
+    if let Err(e) = enable_tcp_keepalive(&stream) {
+        eprintln!("clawx-service: failed to enable TCP keepalive: {e}");
+    }
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let register_frame = build_register_frame(node_id, tools, token, user, pwd);
+    let mut line = serde_json::to_string(&register_frame)?;
+    line.push('\n');
+    write_half.write_all(line.as_bytes()).await?;
+    write_half.flush().await?;
+
+    let mut response_line = String::new();
+    let bytes_read = reader.read_line(&mut response_line).await?;
+    if bytes_read == 0 {
+        anyhow::bail!("dispatcher closed the connection before responding to registration");
+    }
+
+    let response: Value = serde_json::from_str(response_line.trim())?;
+    match response.get("type").and_then(Value::as_str) {
+        Some("registered") => {
+            eprintln!(
+                "clawx-service: registered as '{node_id}' (user: {user}, tools: {}) with dispatcher {dispatcher}",
+                tools.join(", ")
+            );
+        }
+        Some("error") => {
+            let reason = response
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("dispatcher rejected registration: {reason}");
+        }
+        _ => anyhow::bail!("unexpected registration response: {response}"),
+    }
+
+    serve(reader, write_half).await
+}
+
+/// Sets a moderately aggressive OS-level TCP keepalive on the registration
+/// socket. This is deliberately NOT an application-level heartbeat frame --
+/// docs/PROTOCOL.md still has none, and this doesn't touch the wire
+/// protocol at all. It's a kernel feature that makes the "silence = still
+/// alive" assumption in `serve`'s read loop actually hold when a NAT/router
+/// somewhere in the path drops the connection's state without ever
+/// forwarding a FIN/RST to either side: without a keepalive probe, that
+/// kind of half-dead connection can sit forever, because the local socket
+/// never sees an error and nothing here ever notices the peer is gone.
+/// (Observed in practice testing registration across a DDNS/NAT path: a
+/// `tools/call` on a stale connection hung indefinitely even though
+/// `list_nodes` still reported the node online.)
+fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(20))
+        .with_interval(Duration::from_secs(10));
+    // Windows has no TCP_KEEPCNT-equivalent knob, so socket2 only exposes
+    // `with_retries` on Unix-like targets; Windows just uses its OS default
+    // retry count on top of the time/interval set above.
+    #[cfg(not(windows))]
+    let keepalive = keepalive.with_retries(3);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// Core JSON-RPC loop shared by both transports: reads newline-delimited
+/// requests from `reader`, dispatches each onto its own task (bounded by
+/// `max_in_flight()`), and writes newline-delimited responses to `writer`
+/// via a single dedicated writer task so concurrent handlers can never
+/// interleave their writes on the wire.
+async fn serve<R, W>(reader: R, writer: W) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut reader = reader.lines();
+
+    // A single dedicated writer task owns the output side and is the only
+    // thing that ever writes to it. Requests are handled concurrently
+    // below, so without this, two tasks finishing at the same moment
+    // could interleave their writes and corrupt the JSON-RPC stream on
+    // the wire.
     let (tx, mut rx) = mpsc::channel::<String>(RESPONSE_QUEUE_SIZE);
     let writer_task = tokio::spawn(async move {
-        let mut writer = stdout();
+        let mut writer = writer;
         while let Some(mut out) = rx.recv().await {
             out.push('\n');
             if let Err(e) = writer.write_all(out.as_bytes()).await {
-                eprintln!("mcp-shell-server: failed to write response: {e}");
+                eprintln!("clawx-service: failed to write response: {e}");
                 break;
             }
             if let Err(e) = writer.flush().await {
-                eprintln!("mcp-shell-server: failed to flush stdout: {e}");
+                eprintln!("clawx-service: failed to flush output: {e}");
                 break;
             }
         }
@@ -139,7 +735,7 @@ async fn main() -> Result<()> {
     // silently vanishing or, worse, taking down the whole process -- the
     // Rust analogue of letting a child task's exception escape an
     // unattended TaskGroup/ExceptionGroup.
-    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
+    let semaphore = Arc::new(Semaphore::new(max_in_flight()));
     let jobs = Arc::new(JobStore::new());
     let mut in_flight: JoinSet<()> = JoinSet::new();
 
@@ -165,6 +761,7 @@ async fn main() -> Result<()> {
         let JsonRpcRequest {
             id, method, params, ..
         } = req;
+        log_task_verbose(id.as_ref().unwrap_or(&Value::Null), &method, &params);
         let Some(req_id) = id else { continue };
 
         let tx = tx.clone();
@@ -181,7 +778,7 @@ async fn main() -> Result<()> {
                 Ok(out) => {
                     let _ = tx.send(out).await;
                 }
-                Err(e) => eprintln!("mcp-shell-server: failed to serialize response: {e}"),
+                Err(e) => eprintln!("clawx-service: failed to serialize response: {e}"),
             }
         });
 
@@ -190,7 +787,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Stdin closed. Drain every still-running request instead of dropping
+    // Input closed. Drain every still-running request instead of dropping
     // their JoinHandles, so a handler that was mid-flight gets to send its
     // response (or have its panic logged) before we exit.
     while let Some(res) = in_flight.join_next().await {
@@ -205,9 +802,9 @@ async fn main() -> Result<()> {
 fn log_join_result(res: std::result::Result<(), JoinError>) {
     if let Err(e) = res {
         if e.is_panic() {
-            eprintln!("mcp-shell-server: a request handler panicked: {e}");
+            eprintln!("clawx-service: a request handler panicked: {e}");
         } else {
-            eprintln!("mcp-shell-server: a request handler was cancelled: {e}");
+            eprintln!("clawx-service: a request handler was cancelled: {e}");
         }
     }
 }
@@ -279,6 +876,16 @@ async fn dispatch(
                             "properties": {"job_id": {"type": "string"}},
                             "required": ["job_id"]
                         }
+                    },
+                    {
+                        "name": "twenty_mcp_list_tools",
+                        "description": "List the native MCP tools available from the connected Twenty CRM instance",
+                        "inputSchema": {"type":"object","properties":{},"required":[]}
+                    },
+                    {
+                        "name": "twenty_mcp_call",
+                        "description": "Execute a native Twenty CRM MCP tool",
+                        "inputSchema": {"type":"object","properties":{"tool_name":{"type":"string"},"arguments":{"type":"object"}},"required":["tool_name"]}
                     }
                 ]
             })),
@@ -303,11 +910,67 @@ fn error_response(id: Value, code: i64, message: impl Into<String>) -> JsonRpcRe
     }
 }
 
+/// Builds the child-process command for running a shell one-liner,
+/// platform-appropriate: `setsid bash -c <command>` on Unix (so we get a
+/// process group we can signal as a whole on timeout, see
+/// `kill_process_group_on_timeout` below), `powershell -Command <command>`
+/// on Windows (no setsid/bash there; PowerShell is the closest thing to a
+/// universally-present shell on a stock Windows box).
+fn shell_command(command: &str) -> Command {
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("setsid");
+        cmd.arg("bash").arg("-c").arg(command);
+        cmd
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("powershell");
+        cmd.arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(command);
+        cmd
+    }
+}
+
+/// Best-effort escalation when a command times out: on Unix, `setsid`
+/// gave the child its own process group, so send TERM to the whole group
+/// (covers subprocesses the command itself spawned, not just the direct
+/// child) before the harder `child.kill()`. On Windows there's no such
+/// group and no `pkill`, so this is a no-op there -- `child.kill()` alone
+/// has to do.
+async fn kill_process_group_on_timeout(pid: u32) {
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("pkill")
+            .arg("-TERM")
+            .arg("-s")
+            .arg(pid.to_string())
+            .output()
+            .await;
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+    }
+}
+
+/// What actually happens when a command times out: send TERM to the whole
+/// process group and give it `grace` to exit on its own, only escalating
+/// to SIGKILL if it's still alive afterwards. Shared by both `bash_exec`
+/// and `bash_exec_async` (via `execute_command`) so there's exactly one
+/// place that encodes "how do we kill a timed-out command".
+async fn terminate_child(child: &mut tokio::process::Child, pid: u32, grace: Duration) {
+    kill_process_group_on_timeout(pid).await;
+    if tokio::time::timeout(grace, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
+}
+
 async fn execute_command(command: &str) -> std::result::Result<(i32, String, String), String> {
-    let mut child = Command::new("setsid")
-        .arg("bash")
-        .arg("-c")
-        .arg(command)
+    let mut child = shell_command(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -324,25 +987,22 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
         .ok_or_else(|| "stderr was not piped".to_string())?;
     let stdout_task = tokio::spawn(read_limited(stdout, MAX_OUTPUT_BYTES));
     let stderr_task = tokio::spawn(read_limited(stderr, MAX_OUTPUT_BYTES));
-    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+    let status = match tokio::time::timeout(command_timeout(), child.wait()).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("Execution failed: {e}")),
         Err(_) => {
-            if let Some(pid) = child.id() {
-                let _ = Command::new("pkill")
-                    .arg("-TERM")
-                    .arg("-s")
-                    .arg(pid.to_string())
-                    .output()
-                    .await;
+            match child.id() {
+                Some(pid) => terminate_child(&mut child, pid, TERMINATE_GRACE).await,
+                None => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
             stdout_task.abort();
             stderr_task.abort();
             return Err(format!(
                 "Execution timed out after {}s",
-                COMMAND_TIMEOUT.as_secs()
+                command_timeout().as_secs()
             ));
         }
     };
@@ -357,6 +1017,102 @@ async fn execute_command(command: &str) -> std::result::Result<(i32, String, Str
     Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
+#[derive(Clone)]
+struct TwentyMcpConfig {
+    url: String,
+    token: String,
+}
+
+impl TwentyMcpConfig {
+    fn from_env() -> Option<Self> {
+        let token = std::env::var("TWENTY_MCP_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let url = std::env::var("TWENTY_MCP_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3100/mcp".to_string());
+        Some(Self { url, token })
+    }
+}
+
+async fn twenty_mcp_request(
+    cfg: &TwentyMcpConfig,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let client = reqwest::Client::new();
+    let init_id = 1;
+    let init = json!({
+        "jsonrpc":"2.0", "id":init_id, "method":"initialize",
+        "params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"clawx-service","version":env!("CARGO_PKG_VERSION")}}
+    });
+    let resp = client
+        .post(&cfg.url)
+        .bearer_auth(&cfg.token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&init)
+        .send()
+        .await
+        .map_err(|e| format!("Twenty MCP initialize failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Twenty MCP initialize HTTP {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let session = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let _init_value = parse_mcp_body(resp.text().await.map_err(|e| e.to_string())?)?;
+
+    let req = json!({"jsonrpc":"2.0","id":2,"method":method,"params":params});
+    let mut r = client
+        .post(&cfg.url)
+        .bearer_auth(&cfg.token)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&req);
+    if let Some(s) = session {
+        r = r.header("Mcp-Session-Id", s);
+    }
+    let resp = r
+        .send()
+        .await
+        .map_err(|e| format!("Twenty MCP request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("Twenty MCP HTTP {status}: {body}"));
+    }
+    parse_mcp_body(body)
+}
+
+fn parse_mcp_body(body: String) -> Result<Value, String> {
+    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+        return Ok(v);
+    }
+    for line in body.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
+            if let Ok(v) = serde_json::from_str::<Value>(data) {
+                return Ok(v);
+            }
+        }
+    }
+    Err(format!(
+        "Invalid MCP response: {}",
+        body.chars().take(1000).collect::<String>()
+    ))
+}
+
+fn twenty_result_text(v: Value) -> String {
+    if let Some(err) = v.get("error") {
+        return format!("Twenty MCP error: {}", err);
+    }
+    v.get("result").cloned().unwrap_or(v).to_string()
+}
+
 async fn handle_tool_call(
     id: Value,
     params: Option<Value>,
@@ -365,6 +1121,39 @@ async fn handle_tool_call(
     let params = params.unwrap_or_default();
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or_default();
+    if name == "twenty_mcp_list_tools" || name == "twenty_mcp_call" {
+        let Some(cfg) = TwentyMcpConfig::from_env() else {
+            return error_response(
+                id,
+                -32000,
+                "Twenty MCP is not configured: set TWENTY_MCP_TOKEN and optionally TWENTY_MCP_URL",
+            );
+        };
+        let (method, call_params) = if name == "twenty_mcp_list_tools" {
+            ("tools/list", json!({}))
+        } else {
+            let tool_name = match args.get("tool_name").and_then(|v| v.as_str()) {
+                Some(v) if !v.is_empty() => v,
+                _ => return error_response(id, -32602, "Missing tool_name argument"),
+            };
+            let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            (
+                "tools/call",
+                json!({"name":tool_name,"arguments":arguments}),
+            )
+        };
+        return match twenty_mcp_request(&cfg, method, call_params).await {
+            Ok(v) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(id),
+                error: None,
+                result: Some(
+                    json!({"content":[{"type":"text","text":twenty_result_text(v)}],"isError":false}),
+                ),
+            },
+            Err(e) => error_response(id, -32000, e),
+        };
+    }
     if name == "bash_job_status" {
         let job_id = match args.get("job_id").and_then(|v| v.as_str()) {
             Some(v) if !v.is_empty() => v,
@@ -427,71 +1216,22 @@ async fn handle_tool_call(
         return error_response(id, -32602, "Unknown tool");
     }
 
-    let mut child = match Command::new("setsid")
-        .arg("bash")
-        .arg("-c")
-        .arg(&command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return error_response(id, -32000, format!("Execution failed: {e}")),
+    // Same execution path as bash_exec_async (spawn, read, timeout, kill);
+    // this just waits for it inline instead of handing back a job_id.
+    let (exit_code, stdout_data, stderr_data) = match execute_command(&command).await {
+        Ok(v) => v,
+        Err(message) => return error_response(id, -32000, message),
     };
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_task = tokio::spawn(read_limited(stdout, MAX_OUTPUT_BYTES));
-    let stderr_task = tokio::spawn(read_limited(stderr, MAX_OUTPUT_BYTES));
-
-    let status = match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return error_response(id, -32000, format!("Execution failed: {e}")),
-        Err(_) => {
-            if let Some(pid) = child.id() {
-                let _ = Command::new("pkill")
-                    .arg("-TERM")
-                    .arg("-s")
-                    .arg(pid.to_string())
-                    .output()
-                    .await;
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stdout_task.abort();
-            stderr_task.abort();
-            return error_response(
-                id,
-                -32000,
-                format!("Execution timed out after {}s", COMMAND_TIMEOUT.as_secs()),
-            );
-        }
-    };
-
-    let stdout_data = match stdout_task.await {
-        Ok(Ok(v)) => v,
-        _ => String::new(),
-    };
-    let stderr_data = match stderr_task.await {
-        Ok(Ok(v)) => v,
-        _ => String::new(),
-    };
-
-    let combined = format!(
-        "Exit Code: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
-        status.code().unwrap_or(-1),
-        stdout_data,
-        stderr_data
-    );
+    let combined =
+        format!("Exit Code: {exit_code}\nSTDOUT:\n{stdout_data}\nSTDERR:\n{stderr_data}");
     // Avoid duplicating potentially large stdout/stderr in structuredContent.
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id: Some(id),
         result: Some(json!({
             "content": [{"type": "text", "text": combined}],
-            "isError": !status.success()
+            "isError": exit_code != 0
         })),
         error: None,
     }
@@ -523,4 +1263,39 @@ where
         s.push_str("\n[output truncated at 8 MiB]");
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tools_accepts_known_names_and_trims_whitespace() {
+        let tools = parse_tools(Some(" bash_exec, bash_exec_async ")).unwrap();
+        assert_eq!(tools, vec!["bash_exec", "bash_exec_async"]);
+    }
+
+    #[test]
+    fn parse_tools_absent_or_empty_means_nothing_exposed() {
+        assert_eq!(parse_tools(None).unwrap(), Vec::<String>::new());
+        assert_eq!(parse_tools(Some("")).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_tools_rejects_unknown_names() {
+        assert!(parse_tools(Some("bash_exec,not_a_real_tool")).is_err());
+    }
+
+    #[test]
+    fn register_frame_is_protocol_v3_with_user_and_pwd() {
+        let tools = vec!["bash_exec".to_string()];
+        let frame = build_register_frame("gpu-node", &tools, "tok", "alice", "hunter2");
+        assert_eq!(frame["type"], "register");
+        assert_eq!(frame["version"], 3);
+        assert_eq!(frame["node_id"], "gpu-node");
+        assert_eq!(frame["tools"], json!(["bash_exec"]));
+        assert_eq!(frame["token"], "tok");
+        assert_eq!(frame["user"], "alice");
+        assert_eq!(frame["pwd"], "hunter2");
+    }
 }
